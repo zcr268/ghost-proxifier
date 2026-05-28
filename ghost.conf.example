@@ -2,7 +2,13 @@
 # Put this file as ghost.conf next to ghost-proxifier.exe and ghost_core.dll.
 
 [global]
+# HTTP CONNECT (default):
 proxy=127.0.0.1:2080
+# SOCKS5 (no-auth) is also supported:
+# proxy=socks5://127.0.0.1:1080
+# or:
+# proxy_type=socks5
+# proxy=127.0.0.1:1080
 process=chrome.exe
 process=msedge.exe
 process=Code.exe

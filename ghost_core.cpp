@@ -77,6 +77,8 @@ gethostbyname_t real_gethostbyname = NULL;
 
 std::string g_ProxyIP = "127.0.0.1";
 int g_ProxyPort = 2080;
+enum class ProxyType { Http, Socks5 };
+ProxyType g_ProxyType = ProxyType::Http;
 
 struct DirectIpRule {
   DWORD network; // network byte order
@@ -111,7 +113,7 @@ bool GetDomainByRealIp(DWORD net_ip, std::string& domain) {
 }
 
 void NetLog(const char *format, ...);
-bool PerformHttpConnect(SOCKET s, const char *ip_str, int port, int family, const std::string& domain = "");
+bool PerformProxyConnect(SOCKET s, const char *ip_str, int port, int family, const std::string& domain = "");
 
 // --- Pending Proxy (Lazy Handshake) ---
 struct PendingProxy {
@@ -159,7 +161,7 @@ bool CompletePendingHandshake(SOCKET s) {
     ioctlsocket(s, FIONBIO, &m);
     int opt = 1;
     setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (char*)&opt, sizeof(opt));
-    bool ok = PerformHttpConnect(s, pp.target_ip.c_str(), pp.target_port, pp.target_family, pp.domain);
+    bool ok = PerformProxyConnect(s, pp.target_ip.c_str(), pp.target_port, pp.target_family, pp.domain);
     // Send any initial data from ConnectEx
     if (ok && !pp.initial_data.empty()) {
         ok = (real_send(s, pp.initial_data.data(), (int)pp.initial_data.size(), 0) > 0);
@@ -246,9 +248,21 @@ std::string ToLower(std::string s) {
 bool ParseProxyAddress(const std::string &value, std::string &host, int &port) {
   std::string v = Trim(value);
   if (v.empty()) return false;
+  std::string lower = ToLower(v);
+  const std::string httpPrefix = "http://";
+  const std::string socksPrefix = "socks5://";
+  if (lower.rfind(httpPrefix, 0) == 0) {
+    g_ProxyType = ProxyType::Http;
+    v = Trim(v.substr(httpPrefix.size()));
+  } else if (lower.rfind(socksPrefix, 0) == 0) {
+    g_ProxyType = ProxyType::Socks5;
+    v = Trim(v.substr(socksPrefix.size()));
+  }
   size_t pos = v.rfind(':');
   if (pos == std::string::npos || pos == 0 || pos + 1 >= v.size()) return false;
   host = Trim(v.substr(0, pos));
+  if (host.size() >= 2 && host.front() == '[' && host.back() == ']')
+    host = host.substr(1, host.size() - 2);
   std::string portText = Trim(v.substr(pos + 1));
   try {
     int p = std::stoi(portText);
@@ -341,12 +355,18 @@ bool CurrentProcessMatchesSection(const std::string &sectionName) {
 void ApplyConfigKey(const std::string &key, const std::string &value) {
   std::string k = ToLower(Trim(key));
   std::string v = Trim(value);
-  if (k == "proxy" || k == "upstream") {
+  if (k == "proxy" || k == "upstream" || k == "http_proxy" || k == "socks5" || k == "socks5_proxy") {
+    if (k == "http_proxy") g_ProxyType = ProxyType::Http;
+    if (k == "socks5" || k == "socks5_proxy") g_ProxyType = ProxyType::Socks5;
     std::string host; int port = 0;
     if (ParseProxyAddress(v, host, port)) {
       g_ProxyIP = host;
       g_ProxyPort = port;
     }
+  } else if (k == "proxy_type" || k == "type" || k == "protocol") {
+    std::string lower = ToLower(v);
+    if (lower == "socks5" || lower == "socks") g_ProxyType = ProxyType::Socks5;
+    else if (lower == "http" || lower == "http-connect" || lower == "connect") g_ProxyType = ProxyType::Http;
   } else if (k == "direct" || k == "bypass") {
     AddDirectRule(v);
   } else if (k == "direct_domain" || k == "bypass_domain") {
@@ -502,6 +522,26 @@ bool SyncRecvResponse(SOCKET s, std::string &resp) {
   return true;
 }
 
+bool SyncRecvExact(SOCKET s, char *buf, int len) {
+  int got = 0;
+  while (got < len) {
+    int n = real_recv(s, buf + got, len - got, 0);
+    if (n > 0) {
+      got += n;
+    } else if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
+      fd_set rfds;
+      FD_ZERO(&rfds);
+      FD_SET(s, &rfds);
+      timeval tv = {5, 0};
+      if (select(0, &rfds, NULL, NULL, &tv) <= 0)
+        return false;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool PerformHttpConnect(SOCKET s, const char *ip_str, int port, int family, const std::string& domain) {
   char request[512];
   int req_len = 0;
@@ -538,6 +578,73 @@ bool PerformHttpConnect(SOCKET s, const char *ip_str, int port, int family, cons
   return false;
 }
 
+bool PerformSocks5Connect(SOCKET s, const char *ip_str, int port, int family, const std::string& domain) {
+  unsigned char hello[3] = {0x05, 0x01, 0x00}; // SOCKS5, one method, no-auth
+  if (!SyncSend(s, (const char*)hello, sizeof(hello)))
+    return false;
+  unsigned char helloResp[2] = {0};
+  if (!SyncRecvExact(s, (char*)helloResp, sizeof(helloResp)))
+    return false;
+  if (helloResp[0] != 0x05 || helloResp[1] != 0x00)
+    return false;
+
+  std::vector<unsigned char> req;
+  req.push_back(0x05); // VER
+  req.push_back(0x01); // CMD CONNECT
+  req.push_back(0x00); // RSV
+
+  if (!domain.empty() && domain.size() <= 255) {
+    req.push_back(0x03); // ATYP DOMAINNAME
+    req.push_back((unsigned char)domain.size());
+    req.insert(req.end(), domain.begin(), domain.end());
+  } else if (family == AF_INET6) {
+    in6_addr a6;
+    if (inet_pton(AF_INET6, ip_str, &a6) != 1)
+      return false;
+    req.push_back(0x04); // ATYP IPv6
+    unsigned char *p = (unsigned char*)&a6;
+    req.insert(req.end(), p, p + 16);
+  } else {
+    in_addr a4;
+    const char *final_host = (port == 53) ? "8.8.8.8" : ip_str;
+    if (inet_pton(AF_INET, final_host, &a4) != 1)
+      return false;
+    req.push_back(0x01); // ATYP IPv4
+    unsigned char *p = (unsigned char*)&a4;
+    req.insert(req.end(), p, p + 4);
+  }
+  req.push_back((unsigned char)((port >> 8) & 0xFF));
+  req.push_back((unsigned char)(port & 0xFF));
+
+  if (!SyncSend(s, (const char*)req.data(), (int)req.size()))
+    return false;
+
+  unsigned char head[4] = {0};
+  if (!SyncRecvExact(s, (char*)head, sizeof(head)))
+    return false;
+  if (head[0] != 0x05 || head[1] != 0x00)
+    return false;
+
+  int addrLen = 0;
+  if (head[3] == 0x01) addrLen = 4;
+  else if (head[3] == 0x04) addrLen = 16;
+  else if (head[3] == 0x03) {
+    unsigned char lenByte = 0;
+    if (!SyncRecvExact(s, (char*)&lenByte, 1)) return false;
+    addrLen = lenByte;
+  } else {
+    return false;
+  }
+  std::vector<char> tail(addrLen + 2);
+  return SyncRecvExact(s, tail.data(), (int)tail.size());
+}
+
+bool PerformProxyConnect(SOCKET s, const char *ip_str, int port, int family, const std::string& domain) {
+  if (g_ProxyType == ProxyType::Socks5)
+    return PerformSocks5Connect(s, ip_str, port, family, domain);
+  return PerformHttpConnect(s, ip_str, port, family, domain);
+}
+
 // --- DNS over TCP Worker ---
 struct DnsReq {
   sockaddr_in client_addr;
@@ -561,7 +668,7 @@ DWORD WINAPI DnsWorkerThread(LPVOID param) {
     int opt = 1;
     setsockopt(tcp_sock, SOL_SOCKET, SO_KEEPALIVE, (char *)&opt, sizeof(opt));
     std::string empty_domain = "";
-    if (PerformHttpConnect(tcp_sock, "8.8.8.8", 53, AF_INET, empty_domain)) {
+    if (PerformProxyConnect(tcp_sock, "8.8.8.8", 53, AF_INET, empty_domain)) {
       unsigned short len_n = htons((unsigned short)req->len);
       real_send(tcp_sock, (char *)&len_n, 2, 0);
       real_send(tcp_sock, req->buf, req->len, 0);
@@ -731,7 +838,7 @@ SOCKET CreateDnsConn() {
     int opt = 1;
     setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (char*)&opt, sizeof(opt));
     std::string empty;
-    if (!PerformHttpConnect(s, "8.8.8.8", 53, AF_INET, empty)) {
+    if (!PerformProxyConnect(s, "8.8.8.8", 53, AF_INET, empty)) {
         closesocket(s);
         return INVALID_SOCKET;
     }
@@ -1398,7 +1505,9 @@ DWORD WINAPI SetupThread(LPVOID lpParam) {
                   (void **)&real_WSARecvFrom);
   CreateThread(NULL, 0, DnsProxyThread, NULL, 0, NULL);
   MH_EnableHook(MH_ALL_HOOKS);
-  NetLog("[Init] Hooks installed successfully (PID: %d, proxy: %s:%d, direct domains: %d, direct IP rules: %d)", GetCurrentProcessId(), g_ProxyIP.c_str(), g_ProxyPort, (int)g_DirectDomains.size(), (int)g_DirectIpRules.size());
+  NetLog("[Init] Hooks installed successfully (PID: %d, proxy: %s://%s:%d, direct domains: %d, direct IP rules: %d)",
+         GetCurrentProcessId(), g_ProxyType == ProxyType::Socks5 ? "socks5" : "http",
+         g_ProxyIP.c_str(), g_ProxyPort, (int)g_DirectDomains.size(), (int)g_DirectIpRules.size());
   } __except(EXCEPTION_EXECUTE_HANDLER) {
     // Silently absorb any crash during initialization
     // This prevents crashing the host process (e.g., Chrome Network Service)
