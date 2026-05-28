@@ -82,20 +82,26 @@ jobs:
           path: ghost-proxifier-tauri-ui-windows-x64.zip
 
       - name: Create GitHub Release
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ($env:GITHUB_REF -like 'refs/tags/*') {
-            $tag = $env:GITHUB_REF_NAME
+          $tag = $env:GITHUB_REF_NAME
+          $assets = @(
+            "ghost-proxifier-windows-x64.zip",
+            "ghost-proxifier-tauri-ui-windows-x64.zip"
+          )
+
+          if (gh release view $tag *> $null) {
+            gh release upload $tag @assets --clobber
+            gh release edit $tag `
+              --target "$env:GITHUB_SHA" `
+              --title "Ghost Proxifier $tag" `
+              --notes "Automated Windows x64 build with Tauri UI."
           } else {
-            $shortSha = $env:GITHUB_SHA.Substring(0, 7)
-            $tag = "build-$env:GITHUB_RUN_NUMBER-$shortSha"
+            gh release create $tag @assets `
+              --target "$env:GITHUB_SHA" `
+              --title "Ghost Proxifier $tag" `
+              --notes "Automated Windows x64 build with Tauri UI."
           }
-          gh release create $tag `
-            "ghost-proxifier-windows-x64.zip" `
-            "ghost-proxifier-tauri-ui-windows-x64.zip" `
-            --target "$env:GITHUB_SHA" `
-            --title "Ghost Proxifier $tag" `
-            --notes "Automated Windows x64 build with Tauri UI."
