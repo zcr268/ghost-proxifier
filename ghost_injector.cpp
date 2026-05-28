@@ -38,6 +38,8 @@ void PrintHelp() {
             << std::endl;
   std::cout << "  -s, --status     List all processes with ghost_core.dll injected."
             << std::endl;
+  std::cout << "  --uninject       Unload ghost_core.dll from matched -p targets and restore hooks."
+            << std::endl;
   std::cout << "  -h, --help, /help, /?  Show this help message." << std::endl;
   std::cout << std::endl;
   std::cout << "Examples:" << std::endl;
@@ -50,6 +52,7 @@ void PrintHelp() {
             << std::endl;
 }
 
+HMODULE FindDllModule(DWORD pid, const char *dllName);
 bool IsDllLoaded(DWORD pid, const char *dllName);
 
 void ListInjectedProcesses(const char *dllName) {
@@ -79,22 +82,22 @@ void ListInjectedProcesses(const char *dllName) {
   std::cout << "=========================================================" << std::endl;
 }
 
-// Check if DLL is already loaded
-bool IsDllLoaded(DWORD pid, const char *dllName) {
+// Find loaded DLL module handle in a remote process.
+HMODULE FindDllModule(DWORD pid, const char *dllName) {
   HANDLE hProcess =
       OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
   if (!hProcess)
-    return false;
+    return NULL;
   HMODULE hMods[1024];
   DWORD cbNeeded;
-  bool found = false;
+  HMODULE found = NULL;
   if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
     for (unsigned int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
       char szModName[MAX_PATH];
       if (GetModuleFileNameExA(hProcess, hMods[i], szModName,
                                sizeof(szModName))) {
         if (strstr(szModName, dllName)) {
-          found = true;
+          found = hMods[i];
           break;
         }
       }
@@ -102,6 +105,11 @@ bool IsDllLoaded(DWORD pid, const char *dllName) {
   }
   CloseHandle(hProcess);
   return found;
+}
+
+// Check if DLL is already loaded
+bool IsDllLoaded(DWORD pid, const char *dllName) {
+  return FindDllModule(pid, dllName) != NULL;
 }
 
 // TCP Log Server
@@ -167,6 +175,35 @@ bool Inject(DWORD pid, const char *dllName) {
   }
   CloseHandle(h);
   return false;
+}
+
+bool Uninject(DWORD pid, const char *dllName) {
+  HMODULE module = FindDllModule(pid, dllName);
+  if (!module) return false;
+
+  HANDLE h = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+                             PROCESS_VM_OPERATION | PROCESS_VM_READ,
+                         FALSE, pid);
+  if (!h) return false;
+
+  auto freeLibrary = (LPTHREAD_START_ROUTINE)GetProcAddress(
+      GetModuleHandleA("kernel32.dll"), "FreeLibrary");
+  if (!freeLibrary) {
+    CloseHandle(h);
+    return false;
+  }
+
+  HANDLE t = CreateRemoteThread(h, NULL, 0, freeLibrary, module, 0, NULL);
+  if (!t) {
+    CloseHandle(h);
+    return false;
+  }
+  WaitForSingleObject(t, 3000);
+  DWORD exitCode = 0;
+  GetExitCodeThread(t, &exitCode);
+  CloseHandle(t);
+  CloseHandle(h);
+  return exitCode != 0;
 }
 
 bool IsNumber(const std::string &s) {
@@ -241,6 +278,45 @@ bool CopyTextFile(const std::string &src, const std::string &dst) {
   return true;
 }
 
+int UninjectTargets(const std::vector<std::string> &targets, const char *dllName) {
+  int restored = 0;
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) {
+    std::cout << "[Error] Failed to create process snapshot." << std::endl;
+    return 0;
+  }
+
+  PROCESSENTRY32 pe = {sizeof(pe)};
+  if (Process32First(snap, &pe)) {
+    do {
+      bool shouldRestore = targets.empty();
+      for (const auto &t : targets) {
+        if (IsNumber(t)) {
+          if (pe.th32ProcessID == (DWORD)std::stoul(t)) shouldRestore = true;
+        } else if (_stricmp(pe.szExeFile, t.c_str()) == 0) {
+          shouldRestore = true;
+        }
+        if (shouldRestore) break;
+      }
+
+      if (shouldRestore && IsDllLoaded(pe.th32ProcessID, dllName)) {
+        if (Uninject(pe.th32ProcessID, dllName)) {
+          std::cout << "[Restore] Unloaded from PID: " << pe.th32ProcessID
+                    << " (" << pe.szExeFile << ")" << std::endl;
+          restored++;
+        } else {
+          std::cout << "[Restore] Failed to unload from PID: "
+                    << pe.th32ProcessID << " (" << pe.szExeFile << ")"
+                    << std::endl;
+        }
+      }
+    } while (Process32Next(snap, &pe));
+  }
+  CloseHandle(snap);
+  std::cout << "[Restore] Total restored: " << restored << std::endl;
+  return restored;
+}
+
 int main(int argc, char *argv[]) {
   if (argc == 1) {
     PrintHelp();
@@ -257,6 +333,7 @@ int main(int argc, char *argv[]) {
   bool watchMode = false;
   bool logOnly = false;
   bool statusMode = false;
+  bool uninjectMode = false;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0 ||
@@ -284,11 +361,18 @@ int main(int argc, char *argv[]) {
       logOnly = true;
     else if (strcmp(argv[i], "--status") == 0 || strcmp(argv[i], "-s") == 0)
       statusMode = true;
+    else if (strcmp(argv[i], "--uninject") == 0 || strcmp(argv[i], "--restore") == 0)
+      uninjectMode = true;
   }
 
   LoadInjectorConfigTargets(configPath, targets, upstream);
 
   const char *dllName = "ghost_core.dll";
+
+  if (uninjectMode) {
+    UninjectTargets(targets, dllName);
+    return 0;
+  }
 
   if (statusMode) {
     ListInjectedProcesses(dllName);

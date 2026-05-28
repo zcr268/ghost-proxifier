@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Ghost Proxifier",
+  "version": "0.1.0",
+  "identifier": "com.ghostproxifier.ui",
+  "build": {
+    "beforeDevCommand": "npm run dev:web",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "npm run build:web",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Ghost Proxifier",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 920,
+        "minHeight": 620
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": [
+      "../bin/ghost-proxifier.exe",
+      "../bin/ghost_core.dll"
+    ]
+  }
+}

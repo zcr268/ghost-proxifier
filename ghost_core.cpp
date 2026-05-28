@@ -1410,6 +1410,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
   if (reason == DLL_PROCESS_ATTACH) {
     DisableThreadLibraryCalls(hModule);
     CreateThread(NULL, 0, SetupThread, NULL, 0, NULL);
+  } else if (reason == DLL_PROCESS_DETACH) {
+    __try {
+      MH_DisableHook(MH_ALL_HOOKS);
+      MH_Uninitialize();
+      if (g_LogSocket != INVALID_SOCKET) {
+        closesocket(g_LogSocket);
+        g_LogSocket = INVALID_SOCKET;
+      }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+    }
   }
   return TRUE;
 }

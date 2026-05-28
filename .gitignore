@@ -1,5 +1,8 @@
 build/
 bin/
+dist/
+node_modules/
+src-tauri/target/
 *.conf
 .idea/
 *.exe

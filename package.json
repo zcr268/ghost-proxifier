@@ -1,0 +1,18 @@
+{
+  "name": "ghost-proxifier-tauri-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev:web": "vite --host 127.0.0.1",
+    "build:web": "vite build",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@vitejs/plugin-legacy": "^5.4.0",
+    "vite": "^5.4.0",
+    "@tauri-apps/cli": "^2.0.0"
+  },
+  "devDependencies": {}
+}
