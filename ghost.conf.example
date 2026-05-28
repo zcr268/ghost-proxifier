@@ -17,6 +17,7 @@ process=Codex.exe
 dns=proxy
 dns_server=8.8.8.8:53
 # IPv6/AAAA is disabled by default to avoid slow IPv6 fallback when IPv6 is unavailable.
+# When off, AF_UNSPEC getaddrinfo calls are also forced to IPv4.
 # Set dns_ipv6=on if you need AAAA answers.
 dns_ipv6=off
 

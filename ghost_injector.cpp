@@ -25,6 +25,19 @@ static HWND g_trayWnd = NULL;
 static NOTIFYICONDATAA g_trayIcon = {};
 static bool g_trayEnabled = true;
 static std::atomic<bool> g_exitRequested{false};
+static WNDPROC g_originalConsoleWndProc = NULL;
+
+void HideConsoleToTray();
+
+LRESULT CALLBACK ConsoleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+  if (msg == WM_CLOSE ||
+      (msg == WM_SYSCOMMAND && ((wParam & 0xFFF0) == SC_CLOSE))) {
+    HideConsoleToTray();
+    std::cout << "[Injector] Close button hides to tray. Use tray menu Exit to quit and restore processes." << std::endl;
+    return 0;
+  }
+  return CallWindowProcA(g_originalConsoleWndProc, hwnd, msg, wParam, lParam);
+}
 
 void RestoreConsoleFromTray() {
   HWND console = GetConsoleWindow();
@@ -38,6 +51,34 @@ void RestoreConsoleFromTray() {
 void HideConsoleToTray() {
   HWND console = GetConsoleWindow();
   if (console) ShowWindow(console, SW_HIDE);
+}
+
+void InstallConsoleCloseToTrayHook() {
+  if (!g_trayEnabled || g_originalConsoleWndProc) return;
+  HWND console = GetConsoleWindow();
+  if (!console) return;
+  g_originalConsoleWndProc =
+      (WNDPROC)SetWindowLongPtrA(console, GWLP_WNDPROC, (LONG_PTR)ConsoleWndProc);
+  if (!g_originalConsoleWndProc) {
+    // Console windows are owned by conhost.exe on modern Windows, so subclassing
+    // can be denied.  In that case disable the Close command to prevent Windows
+    // from force-terminating us without running the restore path.  Minimize and
+    // tray Exit remain available.
+    HMENU menu = GetSystemMenu(console, FALSE);
+    if (menu) {
+      DeleteMenu(menu, SC_CLOSE, MF_BYCOMMAND);
+      DrawMenuBar(console);
+    }
+  }
+}
+
+void UninstallConsoleCloseToTrayHook() {
+  HWND console = GetConsoleWindow();
+  if (console && g_originalConsoleWndProc) {
+    SetWindowLongPtrA(console, GWLP_WNDPROC, (LONG_PTR)g_originalConsoleWndProc);
+    g_originalConsoleWndProc = NULL;
+  }
+  if (console) GetSystemMenu(console, TRUE);
 }
 
 void RemoveTrayIcon() {
@@ -301,6 +342,26 @@ int UnloadAllInjected(const char *dllName) {
   return count;
 }
 
+struct ExitRestoreGuard {
+  const char *dllName;
+  bool enabled;
+  bool restored;
+  ExitRestoreGuard(const char *name) : dllName(name), enabled(false), restored(false) {}
+  void Enable() { enabled = true; }
+  void RestoreNow() {
+    if (!enabled || restored) return;
+    restored = true;
+    std::cout << "[Injector] Restoring process state by unloading ghost_core.dll..." << std::endl;
+    int n = UnloadAllInjected(dllName);
+    std::cout << "[Injector] Restored " << n << " process(es)." << std::endl;
+  }
+  ~ExitRestoreGuard() {
+    RestoreNow();
+    UninstallConsoleCloseToTrayHook();
+    RemoveTrayIcon();
+  }
+};
+
 // TCP Log Server
 void LogServerThread() {
   WSADATA wsa;
@@ -518,6 +579,7 @@ int main(int argc, char *argv[]) {
 
   if (g_trayEnabled && !statusMode) {
     std::thread(TrayThread).detach();
+    InstallConsoleCloseToTrayHook();
   }
 
   std::string exeDir = GetExeDir();
@@ -531,6 +593,7 @@ int main(int argc, char *argv[]) {
 
   const char *dllName = "ghost_core.dll";
   std::string dllPath = exeDir + "\\ghost_core.dll";
+  ExitRestoreGuard restoreGuard(dllName);
 
   if (statusMode) {
     ListInjectedProcesses(dllName);
@@ -543,6 +606,8 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
+  restoreGuard.Enable();
+
   // Always start log server
   std::thread(LogServerThread).detach();
 
@@ -551,7 +616,6 @@ int main(int argc, char *argv[]) {
               << std::endl;
     while (!g_exitRequested.load())
       Sleep(10000);
-    RemoveTrayIcon();
     return 0;
   }
 
@@ -561,7 +625,6 @@ int main(int argc, char *argv[]) {
       std::cout << "[Injector] Double-click mode used: " << configReadPath << " + --watch." << std::endl;
       std::cout << "[Injector] Press Ctrl+C or use tray menu Exit to quit." << std::endl;
       while (!g_exitRequested.load()) Sleep(10000);
-      RemoveTrayIcon();
       return 0;
     }
     return 0;
@@ -574,7 +637,6 @@ int main(int argc, char *argv[]) {
       std::cout << "[Injector] Double-click mode used: " << configReadPath << " + --watch." << std::endl;
       std::cout << "[Injector] Press Ctrl+C or use tray menu Exit to quit." << std::endl;
       while (!g_exitRequested.load()) Sleep(10000);
-      RemoveTrayIcon();
       return 1;
     }
     return 1;
@@ -696,12 +758,7 @@ int main(int argc, char *argv[]) {
     }
   } while (watchMode && !g_exitRequested.load());
 
-  if (g_exitRequested.load()) {
-    std::cout << "[Injector] Exiting. Restoring process state by unloading ghost_core.dll..." << std::endl;
-    int n = UnloadAllInjected(dllName);
-    std::cout << "[Injector] Restored " << n << " process(es)." << std::endl;
-  }
-  RemoveTrayIcon();
+  restoreGuard.RestoreNow();
 
   return 0;
 }

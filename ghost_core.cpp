@@ -90,6 +90,7 @@ DnsMode g_DnsMode = DnsMode::Proxy;
 bool g_DnsIpv6 = false;
 std::string g_DnsServerIP = "8.8.8.8";
 int g_DnsServerPort = 53;
+const DWORD DNS_SOCKET_TIMEOUT_MS = 2500;
 
 struct DirectIpRule {
   DWORD network; // network byte order
@@ -312,6 +313,31 @@ bool ParseBool(const std::string &value, bool defaultValue) {
   if (v == "1" || v == "true" || v == "yes" || v == "on" || v == "enable" || v == "enabled") return true;
   if (v == "0" || v == "false" || v == "no" || v == "off" || v == "disable" || v == "disabled") return false;
   return defaultValue;
+}
+
+bool IsIpLiteral(const char *value) {
+  if (!value || !*value) return false;
+  in_addr a4;
+  in6_addr a6;
+  return inet_pton(AF_INET, value, &a4) == 1 || inet_pton(AF_INET6, value, &a6) == 1;
+}
+
+const ADDRINFOA *Ipv4OnlyHintsA(const ADDRINFOA *src, ADDRINFOA &tmp) {
+  if (g_DnsIpv6) return src;
+  if (src && src->ai_family != AF_UNSPEC) return src;
+  memset(&tmp, 0, sizeof(tmp));
+  if (src) tmp = *src;
+  tmp.ai_family = AF_INET;
+  return &tmp;
+}
+
+const ADDRINFOW *Ipv4OnlyHintsW(const ADDRINFOW *src, ADDRINFOW &tmp) {
+  if (g_DnsIpv6) return src;
+  if (src && src->ai_family != AF_UNSPEC) return src;
+  memset(&tmp, 0, sizeof(tmp));
+  if (src) tmp = *src;
+  tmp.ai_family = AF_INET;
+  return &tmp;
 }
 
 void AddDirectDomain(const std::string &value) {
@@ -744,6 +770,8 @@ DWORD WINAPI DnsWorkerThread(LPVOID param) {
     delete req;
     return 0;
   }
+  setsockopt(tcp_sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&DNS_SOCKET_TIMEOUT_MS, sizeof(DNS_SOCKET_TIMEOUT_MS));
+  setsockopt(tcp_sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&DNS_SOCKET_TIMEOUT_MS, sizeof(DNS_SOCKET_TIMEOUT_MS));
   sockaddr_in p_addr;
   p_addr.sin_family = AF_INET;
   p_addr.sin_addr.s_addr = inet_addr(g_ProxyIP.c_str());
@@ -920,6 +948,8 @@ std::mutex g_DnsPoolMutex;
 SOCKET CreateDnsConn() {
     SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
     if (s == INVALID_SOCKET) return INVALID_SOCKET;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&DNS_SOCKET_TIMEOUT_MS, sizeof(DNS_SOCKET_TIMEOUT_MS));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&DNS_SOCKET_TIMEOUT_MS, sizeof(DNS_SOCKET_TIMEOUT_MS));
     sockaddr_in p_addr;
     p_addr.sin_family = AF_INET;
     p_addr.sin_addr.s_addr = inet_addr(g_ProxyIP.c_str());
@@ -1400,7 +1430,7 @@ int WINAPI hook_WSARecvFrom(
 
 INT WSAAPI hook_getaddrinfo(PCSTR pNodeName, PCSTR pServiceName, const ADDRINFOA *pHints, PADDRINFOA *ppResult) {
     // If not a domain name (NULL or already an IP), pass through
-    if (!pNodeName || inet_addr(pNodeName) != INADDR_NONE) {
+    if (!pNodeName || IsIpLiteral(pNodeName)) {
         return real_getaddrinfo(pNodeName, pServiceName, pHints, ppResult);
     }
     std::string domain = pNodeName;
@@ -1409,9 +1439,11 @@ INT WSAAPI hook_getaddrinfo(PCSTR pNodeName, PCSTR pServiceName, const ADDRINFOA
         NetLog("[DNS] getaddrinfo: fast-fail IPv6/AAAA for %s (dns_ipv6=off)", domain.c_str());
         return EAI_NONAME;
     }
+    ADDRINFOA ipv4Hints;
+    const ADDRINFOA *effectiveHints = Ipv4OnlyHintsA(pHints, ipv4Hints);
     if (g_DnsMode == DnsMode::System) {
         NetLog("[DNS] getaddrinfo: %s uses system DNS (dns=system)", domain.c_str());
-        INT ret = real_getaddrinfo(pNodeName, pServiceName, pHints, ppResult);
+        INT ret = real_getaddrinfo(pNodeName, pServiceName, effectiveHints, ppResult);
         if (ret == 0 && ppResult && *ppResult) {
             for (ADDRINFOA *ptr = *ppResult; ptr != NULL; ptr = ptr->ai_next) {
                 if (ptr->ai_family == AF_INET) {
@@ -1424,7 +1456,7 @@ INT WSAAPI hook_getaddrinfo(PCSTR pNodeName, PCSTR pServiceName, const ADDRINFOA
     }
     if (IsDirectDomain(domain)) {
         NetLog("[Direct] getaddrinfo: %s uses system DNS", domain.c_str());
-        INT ret = real_getaddrinfo(pNodeName, pServiceName, pHints, ppResult);
+        INT ret = real_getaddrinfo(pNodeName, pServiceName, effectiveHints, ppResult);
         if (ret == 0 && ppResult && *ppResult) {
             for (ADDRINFOA *ptr = *ppResult; ptr != NULL; ptr = ptr->ai_next) {
                 if (ptr->ai_family == AF_INET) {
@@ -1453,11 +1485,11 @@ INT WSAAPI hook_getaddrinfo(PCSTR pNodeName, PCSTR pServiceName, const ADDRINFOA
             all_ips += s;
         }
         NetLog("[DNS-Proxy] getaddrinfo: %s -> [%s] (%d IPs)", domain.c_str(), all_ips.c_str(), (int)ips.size());
-        return real_getaddrinfo(ip_str, pServiceName, pHints, ppResult);
+        return real_getaddrinfo(ip_str, pServiceName, effectiveHints, ppResult);
     }
     // Fallback to system resolver if proxy DNS fails
     NetLog("[DNS-Proxy] getaddrinfo: proxy DNS failed for %s, fallback", pNodeName);
-    INT ret = real_getaddrinfo(pNodeName, pServiceName, pHints, ppResult);
+    INT ret = real_getaddrinfo(pNodeName, pServiceName, effectiveHints, ppResult);
     if (ret == 0 && ppResult && *ppResult) {
         for (ADDRINFOA *ptr = *ppResult; ptr != NULL; ptr = ptr->ai_next) {
             if (ptr->ai_family == AF_INET) {
@@ -1476,7 +1508,7 @@ INT WSAAPI hook_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRIN
     char ascii_node[1024] = {0};
     WideCharToMultiByte(CP_UTF8, 0, pNodeName, -1, ascii_node, sizeof(ascii_node), NULL, NULL);
     // If already an IP address, pass through
-    if (inet_addr(ascii_node) != INADDR_NONE) {
+    if (IsIpLiteral(ascii_node)) {
         return real_GetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
     }
     std::string domain = ascii_node;
@@ -1485,9 +1517,11 @@ INT WSAAPI hook_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRIN
         NetLog("[DNS] GetAddrInfoW: fast-fail IPv6/AAAA for %s (dns_ipv6=off)", domain.c_str());
         return EAI_NONAME;
     }
+    ADDRINFOW ipv4Hints;
+    const ADDRINFOW *effectiveHints = Ipv4OnlyHintsW(pHints, ipv4Hints);
     if (g_DnsMode == DnsMode::System) {
         NetLog("[DNS] GetAddrInfoW: %s uses system DNS (dns=system)", domain.c_str());
-        INT ret = real_GetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+        INT ret = real_GetAddrInfoW(pNodeName, pServiceName, effectiveHints, ppResult);
         if (ret == 0 && ppResult && *ppResult) {
             for (ADDRINFOW *ptr = *ppResult; ptr != NULL; ptr = ptr->ai_next) {
                 if (ptr->ai_family == AF_INET) {
@@ -1500,7 +1534,7 @@ INT WSAAPI hook_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRIN
     }
     if (IsDirectDomain(domain)) {
         NetLog("[Direct] GetAddrInfoW: %s uses system DNS", domain.c_str());
-        INT ret = real_GetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+        INT ret = real_GetAddrInfoW(pNodeName, pServiceName, effectiveHints, ppResult);
         if (ret == 0 && ppResult && *ppResult) {
             for (ADDRINFOW *ptr = *ppResult; ptr != NULL; ptr = ptr->ai_next) {
                 if (ptr->ai_family == AF_INET) {
@@ -1531,11 +1565,11 @@ INT WSAAPI hook_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRIN
         // Convert IP string to wide and call real function
         wchar_t wip[INET_ADDRSTRLEN];
         MultiByteToWideChar(CP_UTF8, 0, ip_str, -1, wip, INET_ADDRSTRLEN);
-        return real_GetAddrInfoW(wip, pServiceName, pHints, ppResult);
+        return real_GetAddrInfoW(wip, pServiceName, effectiveHints, ppResult);
     }
     // Fallback to system resolver
     NetLog("[DNS-Proxy] GetAddrInfoW: proxy DNS failed for %s, fallback", ascii_node);
-    INT ret = real_GetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+    INT ret = real_GetAddrInfoW(pNodeName, pServiceName, effectiveHints, ppResult);
     if (ret == 0 && ppResult && *ppResult) {
         for (ADDRINFOW *ptr = *ppResult; ptr != NULL; ptr = ptr->ai_next) {
             if (ptr->ai_family == AF_INET) {
