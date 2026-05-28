@@ -93,15 +93,19 @@ jobs:
             "ghost-proxifier-tauri-ui-windows-x64.zip"
           )
 
-          if (gh release view $tag *> $null) {
+          gh release create $tag @assets `
+            --target "$env:GITHUB_SHA" `
+            --title "Ghost Proxifier $tag" `
+            --notes "Automated Windows x64 build with Tauri UI."
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Release $tag already exists or create failed; updating existing release assets."
             gh release upload $tag @assets --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
             gh release edit $tag `
               --target "$env:GITHUB_SHA" `
               --title "Ghost Proxifier $tag" `
               --notes "Automated Windows x64 build with Tauri UI."
-          } else {
-            gh release create $tag @assets `
-              --target "$env:GITHUB_SHA" `
-              --title "Ghost Proxifier $tag" `
-              --notes "Automated Windows x64 build with Tauri UI."
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
