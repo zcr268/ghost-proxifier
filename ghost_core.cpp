@@ -34,6 +34,11 @@ typedef int(WINAPI *WSAIoctl_t)(
     LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine);
 typedef int(WINAPI *send_t)(SOCKET s, const char *buf, int len, int flags);
 typedef int(WINAPI *recv_t)(SOCKET s, char *buf, int len, int flags);
+typedef int(WINAPI *WSARecv_t)(
+    SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
+    LPDWORD lpNumberOfBytesRecvd, LPDWORD lpFlags,
+    LPWSAOVERLAPPED lpOverlapped,
+    LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine);
 typedef int(WINAPI *sendto_t)(SOCKET s, const char *buf, int len, int flags,
                               const struct sockaddr *to, int tolen);
 typedef int(WINAPI *WSASendTo_t)(
@@ -65,6 +70,7 @@ ConnectEx_t real_ConnectEx = NULL;
 WSAIoctl_t real_WSAIoctl = NULL;
 send_t real_send = NULL;
 recv_t real_recv = NULL;
+WSARecv_t real_WSARecv = NULL;
 sendto_t real_sendto = NULL;
 WSASendTo_t real_WSASendTo = NULL;
 recvfrom_t real_recvfrom = NULL;
@@ -126,7 +132,7 @@ struct PendingProxy {
 std::unordered_map<SOCKET, PendingProxy> g_PendingProxySockets;
 std::mutex g_PendingMutex;
 
-// Complete deferred HTTP CONNECT handshake before first data send
+// Complete deferred proxy handshake before the first socket I/O.
 bool CompletePendingHandshake(SOCKET s) {
     PendingProxy pp;
     {
@@ -156,7 +162,10 @@ bool CompletePendingHandshake(SOCKET s) {
             return false;
         }
     }
-    // Temporarily set blocking for HTTP CONNECT handshake
+    // Temporarily set blocking for proxy handshake.
+    // We cannot reliably query the previous FIONBIO state here, so restore to
+    // non-blocking after the handshake; Winsock callers that use overlapped I/O
+    // are unaffected, and blocking callers still work for normal send/recv.
     unsigned long m = 0;
     ioctlsocket(s, FIONBIO, &m);
     int opt = 1;
@@ -170,9 +179,9 @@ bool CompletePendingHandshake(SOCKET s) {
     m = 1;
     ioctlsocket(s, FIONBIO, &m);
     if (ok) {
-        NetLog("[Proxy] Handshake OK: %s:%d | %s", pp.target_ip.c_str(), pp.target_port, pp.domain.c_str());
+        NetLog("[Proxy] %s handshake OK: %s:%d | %s", g_ProxyType == ProxyType::Socks5 ? "SOCKS5" : "HTTP", pp.target_ip.c_str(), pp.target_port, pp.domain.c_str());
     } else {
-        NetLog("[Proxy] Handshake FAILED: %s:%d | %s", pp.target_ip.c_str(), pp.target_port, pp.domain.c_str());
+        NetLog("[Proxy] %s handshake FAILED: %s:%d | %s", g_ProxyType == ProxyType::Socks5 ? "SOCKS5" : "HTTP", pp.target_ip.c_str(), pp.target_port, pp.domain.c_str());
     }
     return ok;
 }
@@ -1138,6 +1147,27 @@ int WINAPI hook_WSASend(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
                        dwFlags, lpOverlapped, lpCompletionRoutine);
 }
 
+
+int WINAPI hook_recv(SOCKET s, char *buf, int len, int flags) {
+  if (!CompletePendingHandshake(s)) {
+    WSASetLastError(WSAECONNRESET);
+    return SOCKET_ERROR;
+  }
+  return real_recv(s, buf, len, flags);
+}
+
+int WINAPI hook_WSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
+                        LPDWORD lpNumberOfBytesRecvd, LPDWORD lpFlags,
+                        LPWSAOVERLAPPED lpOverlapped,
+                        LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
+  if (!CompletePendingHandshake(s)) {
+    WSASetLastError(WSAECONNRESET);
+    return SOCKET_ERROR;
+  }
+  return real_WSARecv(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags,
+                      lpOverlapped, lpCompletionRoutine);
+}
+
 int WINAPI hook_sendto(SOCKET s, const char *buf, int len, int flags,
                        const struct sockaddr *to, int tolen) {
   if (to && to->sa_family == AF_INET && g_DnsProxyPort > 0 &&
@@ -1490,6 +1520,11 @@ DWORD WINAPI SetupThread(LPVOID lpParam) {
   closesocket(d);
   // Hook send/WSASend for lazy proxy handshake
   MH_CreateHook((void *)real_send, (void *)hook_send, (void **)&real_send);
+  if (real_recv)
+    MH_CreateHook((void *)real_recv, (void *)hook_recv, (void **)&real_recv);
+  real_WSARecv = (WSARecv_t)GetProcAddress(h, "WSARecv");
+  if (real_WSARecv)
+    MH_CreateHook((void *)real_WSARecv, (void *)hook_WSARecv, (void **)&real_WSARecv);
   real_WSASend = (WSASend_t)GetProcAddress(h, "WSASend");
   if (real_WSASend)
     MH_CreateHook((void *)real_WSASend, (void *)hook_WSASend, (void **)&real_WSASend);

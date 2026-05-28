@@ -310,25 +310,22 @@ Create `ghost.conf` beside `ghost-proxifier.exe` and `ghost_core.dll`:
 
 ```ini
 [global]
-proxy=127.0.0.1:2080
-process=chrome.exe
-process=msedge.exe
-process=Code.exe
+# HTTP CONNECT (default):
+# proxy=127.0.0.1:2080
+# SOCKS5 (no-auth):
+proxy=socks5://127.0.0.1:7890
+# or:
+# proxy_type=socks5
+# proxy=127.0.0.1:1080
+process=Codex.exe
 
 # Direct connection rules. Subdomains are matched automatically.
-direct_domain=*.corp.example.com
-direct_domain=intranet.local
-direct_ip=10.0.0.0/8
-direct_ip=172.16.0.0/12
+# Local loopback is direct by default so the app can still talk to local services.
+direct_ip=127.0.0.1
+# direct_domain=*.corp.example.com
+# direct_domain=intranet.local
+# direct_ip=172.16.0.0/12
 direct_ip=192.168.0.0/16
-```
-
-SOCKS5 example:
-
-```ini
-[global]
-proxy=socks5://127.0.0.1:1080
-process=chrome.exe
 ```
 
 Run:
@@ -371,6 +368,8 @@ Rules:
 - `direct_ip=` / `bypass_ip=` supports IPv4 or CIDR, for example `192.168.1.25` or `192.168.0.0/16`.
 - `direct=` / `bypass=` accepts a comma-separated mixed list, for example `direct=*.local,10.0.0.0/8,192.168.1.2`.
 - The old single-line format is still accepted as HTTP CONNECT: `127.0.0.1:2080`.
+
+SOCKS5 handshakes are now completed before the first `send`, `WSASend`, `recv`, or `WSARecv`. This matters for clients that use `ConnectEx` with initial data and then wait for a response; those connections should now appear in the upstream SOCKS5 proxy log as soon as the first socket I/O happens. If the target app only connects to `127.0.0.1`/LAN addresses covered by `direct_ip`, those connections are intentionally direct and will not appear in the SOCKS5 proxy log.
 
 Note: the injected DLL always loads `ghost.conf` from the directory that contains `ghost_core.dll`. When `-c <file>` or `-u <proxy>` is used, the injector writes/copies the runtime config to that directory before injection.
 

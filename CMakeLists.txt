@@ -8,3 +8,8 @@ add_library(ghost_core SHARED ghost_core.cpp)
 add_executable(ghost-proxifier ghost_injector.cpp)
 target_link_libraries(ghost_core minhook ws2_32)
 target_link_libraries(ghost-proxifier ws2_32 psapi)
+
+if(MSVC)
+  target_compile_options(ghost_core PRIVATE /utf-8)
+  target_compile_options(ghost-proxifier PRIVATE /utf-8)
+endif()

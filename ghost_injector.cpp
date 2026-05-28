@@ -10,6 +10,8 @@
 #include <vector>
 #include <sstream>
 #include <cctype>
+#include <io.h>
+#include <fcntl.h>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -266,6 +268,8 @@ std::string FullPath(const std::string &path) {
 }
 
 int main(int argc, char *argv[]) {
+  SetConsoleOutputCP(CP_UTF8);
+  SetConsoleCP(CP_UTF8);
   if (argc == 1) {
     PrintHelp();
     return 0;
