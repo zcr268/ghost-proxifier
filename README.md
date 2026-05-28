@@ -383,3 +383,13 @@ Domains in direct rules use system DNS and direct sockets, so they can go throug
 - Minimize the console window to hide it to the tray; double-click the tray icon to restore it.
 - Right-click the tray icon to choose `Open` or `Exit`.
 - Use `--no-tray` to disable the tray icon/minimize-to-tray behavior.
+
+## DNS and exit behavior
+
+- `dns=proxy` (default) forwards DNS through the configured upstream proxy to `dns_server`.
+- `dns=system` disables Ghost's DNS proxy and uses the normal system/process DNS path.
+- `dns_server=8.8.8.8:53` selects the DNS server used by `dns=proxy`.
+- `dns_ipv6=off` is the default; AAAA/IPv6 DNS queries return quickly with an empty answer to avoid slow IPv6 failures. Use `dns_ipv6=on` if IPv6 is required.
+- Clicking the console close button now hides the window to the tray instead of quitting.
+- Use the tray icon right-click menu `Exit` to quit; on exit the injector unloads `ghost_core.dll` from injected processes so they stop using the proxy.
+- `ghost-proxifier.exe --unload` can be used to restore already-injected processes manually.

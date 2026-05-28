@@ -11,6 +11,15 @@ proxy=socks5://127.0.0.1:7890
 # proxy=127.0.0.1:1080
 process=Codex.exe
 
+# DNS handling:
+# dns=proxy forwards DNS queries through the configured upstream proxy to dns_server.
+# dns=system disables Ghost's DNS proxy and uses the process/system DNS directly.
+dns=proxy
+dns_server=8.8.8.8:53
+# IPv6/AAAA is disabled by default to avoid slow IPv6 fallback when IPv6 is unavailable.
+# Set dns_ipv6=on if you need AAAA answers.
+dns_ipv6=off
+
 # Direct connection rules: use normal LAN/VPN route instead of HTTP CONNECT/SOCKS5 proxy.
 # Local loopback is direct by default so the app can still talk to local services.
 direct_ip=127.0.0.1

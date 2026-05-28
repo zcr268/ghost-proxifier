@@ -11,6 +11,7 @@
 #include <vector>
 #include <sstream>
 #include <cctype>
+#include <atomic>
 #include <io.h>
 #include <fcntl.h>
 
@@ -23,6 +24,7 @@
 static HWND g_trayWnd = NULL;
 static NOTIFYICONDATAA g_trayIcon = {};
 static bool g_trayEnabled = true;
+static std::atomic<bool> g_exitRequested{false};
 
 void RestoreConsoleFromTray() {
   HWND console = GetConsoleWindow();
@@ -40,6 +42,26 @@ void HideConsoleToTray() {
 
 void RemoveTrayIcon() {
   if (g_trayIcon.cbSize) Shell_NotifyIconA(NIM_DELETE, &g_trayIcon);
+}
+
+void RequestExit() {
+  g_exitRequested.store(true);
+  HWND console = GetConsoleWindow();
+  if (console) ShowWindow(console, SW_SHOW);
+}
+
+BOOL WINAPI ConsoleCtrlHandler(DWORD type) {
+  if (type == CTRL_CLOSE_EVENT) {
+    HideConsoleToTray();
+    std::cout << "[Injector] Close button hides to tray. Use tray menu Exit to quit and restore processes." << std::endl;
+    return TRUE;
+  }
+  if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT ||
+      type == CTRL_LOGOFF_EVENT || type == CTRL_SHUTDOWN_EVENT) {
+    RequestExit();
+    return TRUE;
+  }
+  return FALSE;
 }
 
 LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -73,11 +95,13 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
           RestoreConsoleFromTray();
           return 0;
         case ID_TRAY_EXIT:
-          RemoveTrayIcon();
-          ExitProcess(0);
+          RequestExit();
           return 0;
       }
       break;
+    case WM_CLOSE:
+      HideConsoleToTray();
+      return 0;
     case WM_DESTROY:
       RemoveTrayIcon();
       PostQuitMessage(0);
@@ -143,6 +167,8 @@ void PrintHelp() {
             << std::endl;
   std::cout << "  -s, --status     List all processes with ghost_core.dll injected."
             << std::endl;
+  std::cout << "  --unload         Unload ghost_core.dll from injected processes and exit."
+            << std::endl;
   std::cout << "  -h, --help, /help, /?  Show this help message." << std::endl;
   std::cout << std::endl;
   std::cout << "Examples:" << std::endl;
@@ -151,6 +177,7 @@ void PrintHelp() {
   std::cout << "  ghost-proxifier.exe -c ghost.conf --watch" << std::endl;
   std::cout << "  ghost-proxifier.exe -p 5188 -u socks5://127.0.0.1:1080" << std::endl;
   std::cout << "  ghost-proxifier.exe -s" << std::endl;
+  std::cout << "  ghost-proxifier.exe --unload" << std::endl;
   std::cout << "  ghost-proxifier.exe -l" << std::endl;
   std::cout << "========================================================="
             << std::endl;
@@ -208,6 +235,70 @@ bool IsDllLoaded(DWORD pid, const char *dllName) {
   }
   CloseHandle(hProcess);
   return found;
+}
+
+HMODULE FindDllModule(DWORD pid, const char *dllName) {
+  HANDLE hProcess =
+      OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+  if (!hProcess)
+    return NULL;
+  HMODULE hMods[1024];
+  DWORD cbNeeded;
+  HMODULE found = NULL;
+  if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
+    for (unsigned int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
+      char szModName[MAX_PATH];
+      if (GetModuleFileNameExA(hProcess, hMods[i], szModName,
+                               sizeof(szModName))) {
+        if (strstr(szModName, dllName)) {
+          found = hMods[i];
+          break;
+        }
+      }
+    }
+  }
+  CloseHandle(hProcess);
+  return found;
+}
+
+bool Unload(DWORD pid, const char *dllName) {
+  HMODULE mod = FindDllModule(pid, dllName);
+  if (!mod) return false;
+  HANDLE h = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+                             PROCESS_VM_OPERATION | PROCESS_VM_READ,
+                         FALSE, pid);
+  if (!h) return false;
+  FARPROC freeLib = GetProcAddress(GetModuleHandleA("kernel32.dll"), "FreeLibrary");
+  HANDLE t = CreateRemoteThread(h, NULL, 0, (LPTHREAD_START_ROUTINE)freeLib,
+                                mod, 0, NULL);
+  if (!t) {
+    CloseHandle(h);
+    return false;
+  }
+  WaitForSingleObject(t, 3000);
+  DWORD exitCode = 0;
+  GetExitCodeThread(t, &exitCode);
+  CloseHandle(t);
+  CloseHandle(h);
+  return exitCode != 0;
+}
+
+int UnloadAllInjected(const char *dllName) {
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return 0;
+  PROCESSENTRY32 pe = {sizeof(pe)};
+  int count = 0;
+  if (Process32First(snap, &pe)) {
+    do {
+      if (Unload(pe.th32ProcessID, dllName)) {
+        std::cout << "[-] Unloaded: " << pe.th32ProcessID << " ("
+                  << pe.szExeFile << ")" << std::endl;
+        count++;
+      }
+    } while (Process32Next(snap, &pe));
+  }
+  CloseHandle(snap);
+  return count;
 }
 
 // TCP Log Server
@@ -385,7 +476,9 @@ int main(int argc, char *argv[]) {
   bool watchMode = false;
   bool logOnly = false;
   bool statusMode = false;
+  bool unloadMode = false;
   bool defaultDoubleClickMode = (argc == 1);
+  SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0 ||
@@ -413,6 +506,8 @@ int main(int argc, char *argv[]) {
       logOnly = true;
     else if (strcmp(argv[i], "--status") == 0 || strcmp(argv[i], "-s") == 0)
       statusMode = true;
+    else if (strcmp(argv[i], "--unload") == 0)
+      unloadMode = true;
     else if (strcmp(argv[i], "--no-tray") == 0)
       g_trayEnabled = false;
   }
@@ -442,14 +537,21 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
+  if (unloadMode) {
+    int n = UnloadAllInjected(dllName);
+    std::cout << "[Injector] Unloaded ghost_core.dll from " << n << " process(es)." << std::endl;
+    return 0;
+  }
+
   // Always start log server
   std::thread(LogServerThread).detach();
 
   if (logOnly) {
     std::cout << "[Injector] Log-only mode. Listening on port 9999..."
               << std::endl;
-    while (true)
+    while (!g_exitRequested.load())
       Sleep(10000);
+    RemoveTrayIcon();
     return 0;
   }
 
@@ -458,7 +560,9 @@ int main(int argc, char *argv[]) {
     if (defaultDoubleClickMode) {
       std::cout << "[Injector] Double-click mode used: " << configReadPath << " + --watch." << std::endl;
       std::cout << "[Injector] Press Ctrl+C or use tray menu Exit to quit." << std::endl;
-      while (true) Sleep(10000);
+      while (!g_exitRequested.load()) Sleep(10000);
+      RemoveTrayIcon();
+      return 0;
     }
     return 0;
   }
@@ -469,7 +573,9 @@ int main(int argc, char *argv[]) {
     else {
       std::cout << "[Injector] Double-click mode used: " << configReadPath << " + --watch." << std::endl;
       std::cout << "[Injector] Press Ctrl+C or use tray menu Exit to quit." << std::endl;
-      while (true) Sleep(10000);
+      while (!g_exitRequested.load()) Sleep(10000);
+      RemoveTrayIcon();
+      return 1;
     }
     return 1;
   }
@@ -568,6 +674,10 @@ int main(int argc, char *argv[]) {
     CloseHandle(snap);
     totalInjected += currentRoundInjected;
 
+    if (g_exitRequested.load()) {
+      break;
+    }
+
     if (watchMode) {
       Sleep(2000);
     } else {
@@ -580,10 +690,18 @@ int main(int argc, char *argv[]) {
         std::cout << "[Info] Waiting for logs from any existing hooks..."
                   << std::endl;
       }
-      while (true)
+      while (!g_exitRequested.load())
         Sleep(10000);
+      break;
     }
-  } while (watchMode);
+  } while (watchMode && !g_exitRequested.load());
+
+  if (g_exitRequested.load()) {
+    std::cout << "[Injector] Exiting. Restoring process state by unloading ghost_core.dll..." << std::endl;
+    int n = UnloadAllInjected(dllName);
+    std::cout << "[Injector] Restored " << n << " process(es)." << std::endl;
+  }
+  RemoveTrayIcon();
 
   return 0;
 }

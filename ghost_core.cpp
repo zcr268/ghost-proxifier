@@ -85,6 +85,11 @@ std::string g_ProxyIP = "127.0.0.1";
 int g_ProxyPort = 2080;
 enum class ProxyType { Http, Socks5 };
 ProxyType g_ProxyType = ProxyType::Http;
+enum class DnsMode { Proxy, System };
+DnsMode g_DnsMode = DnsMode::Proxy;
+bool g_DnsIpv6 = false;
+std::string g_DnsServerIP = "8.8.8.8";
+int g_DnsServerPort = 53;
 
 struct DirectIpRule {
   DWORD network; // network byte order
@@ -96,6 +101,7 @@ std::vector<std::string> g_DirectDomains;
 std::vector<DirectIpRule> g_DirectIpRules;
 SOCKET g_DnsProxyUdpSocket = INVALID_SOCKET;
 int g_DnsProxyPort = 0;
+std::atomic<bool> g_Running{true};
 
 // --- Forward Declarations ---
 // --- Domain Reverse Map (Real IP -> Domain) ---
@@ -235,7 +241,7 @@ void NetLog(const char *format, ...) {
     if (g_LogSocket == INVALID_SOCKET) return;
     if (real_send && real_send(g_LogSocket, line, len, 0) > 0)
       return; // success
-    // Send failed, connection broken — close and retry
+    // Send failed, connection broken - close and retry
     closesocket(g_LogSocket);
     g_LogSocket = INVALID_SOCKET;
   }
@@ -281,6 +287,31 @@ bool ParseProxyAddress(const std::string &value, std::string &host, int &port) {
   } catch (...) {
     return false;
   }
+}
+
+bool ParseHostPort(const std::string &value, std::string &host, int &port) {
+  std::string v = Trim(value);
+  if (v.empty()) return false;
+  size_t pos = v.rfind(':');
+  if (pos == std::string::npos || pos == 0 || pos + 1 >= v.size()) return false;
+  host = Trim(v.substr(0, pos));
+  if (host.size() >= 2 && host.front() == '[' && host.back() == ']')
+    host = host.substr(1, host.size() - 2);
+  try {
+    int p = std::stoi(Trim(v.substr(pos + 1)));
+    if (p <= 0 || p > 65535 || host.empty()) return false;
+    port = p;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool ParseBool(const std::string &value, bool defaultValue) {
+  std::string v = ToLower(Trim(value));
+  if (v == "1" || v == "true" || v == "yes" || v == "on" || v == "enable" || v == "enabled") return true;
+  if (v == "0" || v == "false" || v == "no" || v == "off" || v == "disable" || v == "disabled") return false;
+  return defaultValue;
 }
 
 void AddDirectDomain(const std::string &value) {
@@ -382,6 +413,24 @@ void ApplyConfigKey(const std::string &key, const std::string &value) {
     AddDirectDomain(v);
   } else if (k == "direct_ip" || k == "bypass_ip") {
     AddDirectIpRule(v);
+  } else if (k == "dns" || k == "dns_mode" || k == "dns_proxy") {
+    std::string lower = ToLower(v);
+    if (lower == "off" || lower == "system" || lower == "direct" || lower == "disable" || lower == "disabled") {
+      g_DnsMode = DnsMode::System;
+    } else if (lower == "on" || lower == "proxy" || lower == "proxied" || lower == "enable" || lower == "enabled") {
+      g_DnsMode = DnsMode::Proxy;
+    }
+  } else if (k == "dns_server" || k == "dns_upstream") {
+    std::string host; int port = 0;
+    if (ParseHostPort(v, host, port)) {
+      g_DnsServerIP = host;
+      g_DnsServerPort = port;
+    } else if (!v.empty()) {
+      g_DnsServerIP = v;
+      g_DnsServerPort = 53;
+    }
+  } else if (k == "dns_ipv6" || k == "ipv6_dns" || k == "dns_aaaa") {
+    g_DnsIpv6 = ParseBool(v, g_DnsIpv6);
   }
 }
 
@@ -654,6 +703,26 @@ bool PerformProxyConnect(SOCKET s, const char *ip_str, int port, int family, con
   return PerformHttpConnect(s, ip_str, port, family, domain);
 }
 
+unsigned short GetDnsQuestionType(const char *buf, int len) {
+  if (!buf || len < 16) return 0;
+  int off = 12;
+  GetDnsName(buf, off, len);
+  if (off + 4 > len) return 0;
+  return ntohs(*(unsigned short *)(buf + off));
+}
+
+void SendDnsNoDataResponse(const char *query, int len, const sockaddr_in &client, int clientLen) {
+  if (!query || len < 12 || g_DnsProxyUdpSocket == INVALID_SOCKET) return;
+  std::vector<char> resp(query, query + len);
+  resp[2] = (char)0x81; // response + recursion desired
+  resp[3] = (char)0x80; // recursion available, NOERROR
+  resp[6] = resp[7] = 0; // ANCOUNT
+  resp[8] = resp[9] = 0; // NSCOUNT
+  resp[10] = resp[11] = 0; // ARCOUNT
+  real_sendto(g_DnsProxyUdpSocket, resp.data(), (int)resp.size(), 0,
+              (const sockaddr *)&client, clientLen);
+}
+
 // --- DNS over TCP Worker ---
 struct DnsReq {
   sockaddr_in client_addr;
@@ -663,6 +732,13 @@ struct DnsReq {
 };
 DWORD WINAPI DnsWorkerThread(LPVOID param) {
   DnsReq *req = (DnsReq *)param;
+  unsigned short qtype = GetDnsQuestionType(req->buf, req->len);
+  if (qtype == 28 && !g_DnsIpv6) {
+    SendDnsNoDataResponse(req->buf, req->len, req->client_addr, req->client_len);
+    NetLog("[DNS] AAAA query answered locally with empty response (dns_ipv6=off)");
+    delete req;
+    return 0;
+  }
   SOCKET tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
   if (tcp_sock == INVALID_SOCKET) {
     delete req;
@@ -677,7 +753,7 @@ DWORD WINAPI DnsWorkerThread(LPVOID param) {
     int opt = 1;
     setsockopt(tcp_sock, SOL_SOCKET, SO_KEEPALIVE, (char *)&opt, sizeof(opt));
     std::string empty_domain = "";
-    if (PerformProxyConnect(tcp_sock, "8.8.8.8", 53, AF_INET, empty_domain)) {
+    if (PerformProxyConnect(tcp_sock, g_DnsServerIP.c_str(), g_DnsServerPort, AF_INET, empty_domain)) {
       unsigned short len_n = htons((unsigned short)req->len);
       real_send(tcp_sock, (char *)&len_n, 2, 0);
       real_send(tcp_sock, req->buf, req->len, 0);
@@ -754,6 +830,10 @@ DWORD WINAPI DnsWorkerThread(LPVOID param) {
 }
 
 DWORD WINAPI DnsProxyThread(LPVOID p) {
+  if (g_DnsMode != DnsMode::Proxy) {
+    NetLog("[DNS] Local DNS proxy disabled; using system DNS");
+    return 0;
+  }
   g_DnsProxyUdpSocket = socket(AF_INET, SOCK_DGRAM, 0);
   if (g_DnsProxyUdpSocket == INVALID_SOCKET)
     return 0;
@@ -765,11 +845,15 @@ DWORD WINAPI DnsProxyThread(LPVOID p) {
   int l = sizeof(a);
   getsockname(g_DnsProxyUdpSocket, (sockaddr *)&a, &l);
   g_DnsProxyPort = ntohs(a.sin_port);
-  NetLog("[DNS] Local Gateway Ready on 127.0.0.1:%d", g_DnsProxyPort);
+  NetLog("[DNS] Local Gateway Ready on 127.0.0.1:%d -> %s:%d via %s proxy (dns_ipv6=%s)",
+         g_DnsProxyPort, g_DnsServerIP.c_str(), g_DnsServerPort,
+         g_ProxyType == ProxyType::Socks5 ? "SOCKS5" : "HTTP",
+         g_DnsIpv6 ? "on" : "off");
   char buf[2048];
   sockaddr_in c_addr;
   int c_len = sizeof(c_addr);
-  while (true) {
+  while (g_Running.load()) {
+    c_len = sizeof(c_addr);
     int n = real_recvfrom(g_DnsProxyUdpSocket, buf, 2048, 0,
                           (sockaddr *)&c_addr, &c_len);
     if (n > 0) {
@@ -847,7 +931,7 @@ SOCKET CreateDnsConn() {
     int opt = 1;
     setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (char*)&opt, sizeof(opt));
     std::string empty;
-    if (!PerformProxyConnect(s, "8.8.8.8", 53, AF_INET, empty)) {
+    if (!PerformProxyConnect(s, g_DnsServerIP.c_str(), g_DnsServerPort, AF_INET, empty)) {
         closesocket(s);
         return INVALID_SOCKET;
     }
@@ -928,7 +1012,7 @@ bool DnsQueryOnSocket(SOCKET s, const char* query, int qlen, std::vector<DWORD>&
 
 std::vector<DWORD> ProxyDnsResolve(const char* domain) {
     std::vector<DWORD> results;
-    if (!domain) return results;
+    if (!domain || g_DnsMode != DnsMode::Proxy) return results;
     std::string key(domain);
     // Check cache
     {
@@ -1000,7 +1084,7 @@ BOOL PASCAL hook_ConnectEx(SOCKET s, const struct sockaddr *name, int namelen,
       if (strcmp(ip, "::1") == 0)
         is_local = true;
     }
-    if (IsKnownDoHServer(ip, port)) {
+    if (g_DnsMode == DnsMode::Proxy && IsKnownDoHServer(ip, port)) {
       NetLog("[hook] Blocking DoH server %s:%d to force DNS fallback", ip, port);
       WSASetLastError(WSAECONNREFUSED);
       return FALSE;
@@ -1050,7 +1134,7 @@ int WINAPI hook_WSAConnect(SOCKET s, const sockaddr *name, int namelen,
       if (strcmp(ip, "::1") == 0)
         is_local = true;
     }
-    if (IsKnownDoHServer(ip, port)) {
+    if (g_DnsMode == DnsMode::Proxy && IsKnownDoHServer(ip, port)) {
       NetLog("[hook] Blocking DoH server %s:%d to force DNS fallback", ip, port);
       WSASetLastError(WSAECONNREFUSED);
       return SOCKET_ERROR;
@@ -1103,7 +1187,7 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
       if (strcmp(ip, "::1") == 0)
         is_local = true;
     }
-    if (IsKnownDoHServer(ip, port)) {
+    if (g_DnsMode == DnsMode::Proxy && IsKnownDoHServer(ip, port)) {
       NetLog("[hook] Blocking DoH server %s:%d to force DNS fallback", ip, port);
       WSASetLastError(WSAECONNREFUSED);
       return SOCKET_ERROR;
@@ -1321,6 +1405,23 @@ INT WSAAPI hook_getaddrinfo(PCSTR pNodeName, PCSTR pServiceName, const ADDRINFOA
     }
     std::string domain = pNodeName;
     if (!domain.empty() && domain.back() == '.') domain.pop_back();
+    if (!g_DnsIpv6 && pHints && pHints->ai_family == AF_INET6) {
+        NetLog("[DNS] getaddrinfo: fast-fail IPv6/AAAA for %s (dns_ipv6=off)", domain.c_str());
+        return EAI_NONAME;
+    }
+    if (g_DnsMode == DnsMode::System) {
+        NetLog("[DNS] getaddrinfo: %s uses system DNS (dns=system)", domain.c_str());
+        INT ret = real_getaddrinfo(pNodeName, pServiceName, pHints, ppResult);
+        if (ret == 0 && ppResult && *ppResult) {
+            for (ADDRINFOA *ptr = *ppResult; ptr != NULL; ptr = ptr->ai_next) {
+                if (ptr->ai_family == AF_INET) {
+                    sockaddr_in *ipv4 = (sockaddr_in *)ptr->ai_addr;
+                    RecordIpDomainMapping(ipv4->sin_addr.s_addr, domain);
+                }
+            }
+        }
+        return ret;
+    }
     if (IsDirectDomain(domain)) {
         NetLog("[Direct] getaddrinfo: %s uses system DNS", domain.c_str());
         INT ret = real_getaddrinfo(pNodeName, pServiceName, pHints, ppResult);
@@ -1380,6 +1481,23 @@ INT WSAAPI hook_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRIN
     }
     std::string domain = ascii_node;
     if (!domain.empty() && domain.back() == '.') domain.pop_back();
+    if (!g_DnsIpv6 && pHints && pHints->ai_family == AF_INET6) {
+        NetLog("[DNS] GetAddrInfoW: fast-fail IPv6/AAAA for %s (dns_ipv6=off)", domain.c_str());
+        return EAI_NONAME;
+    }
+    if (g_DnsMode == DnsMode::System) {
+        NetLog("[DNS] GetAddrInfoW: %s uses system DNS (dns=system)", domain.c_str());
+        INT ret = real_GetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+        if (ret == 0 && ppResult && *ppResult) {
+            for (ADDRINFOW *ptr = *ppResult; ptr != NULL; ptr = ptr->ai_next) {
+                if (ptr->ai_family == AF_INET) {
+                    sockaddr_in *ipv4 = (sockaddr_in *)ptr->ai_addr;
+                    RecordIpDomainMapping(ipv4->sin_addr.s_addr, domain);
+                }
+            }
+        }
+        return ret;
+    }
     if (IsDirectDomain(domain)) {
         NetLog("[Direct] GetAddrInfoW: %s uses system DNS", domain.c_str());
         INT ret = real_GetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
@@ -1435,6 +1553,18 @@ struct hostent* WSAAPI hook_gethostbyname(const char *name) {
     }
     std::string domain = name;
     if (!domain.empty() && domain.back() == '.') domain.pop_back();
+    if (g_DnsMode == DnsMode::System) {
+        NetLog("[DNS] gethostbyname: %s uses system DNS (dns=system)", domain.c_str());
+        struct hostent* ret = real_gethostbyname(name);
+        if (ret) {
+            for (int i = 0; ret->h_addr_list[i] != 0; ++i) {
+                struct in_addr addr;
+                memcpy(&addr, ret->h_addr_list[i], sizeof(struct in_addr));
+                RecordIpDomainMapping(addr.s_addr, domain);
+            }
+        }
+        return ret;
+    }
     if (IsDirectDomain(domain)) {
         NetLog("[Direct] gethostbyname: %s uses system DNS", domain.c_str());
         struct hostent* ret = real_gethostbyname(name);
@@ -1538,14 +1668,38 @@ DWORD WINAPI SetupThread(LPVOID lpParam) {
   if (real_WSARecvFrom)
     MH_CreateHook((void *)real_WSARecvFrom, (void *)hook_WSARecvFrom,
                   (void **)&real_WSARecvFrom);
-  CreateThread(NULL, 0, DnsProxyThread, NULL, 0, NULL);
+  if (g_DnsMode == DnsMode::Proxy)
+    CreateThread(NULL, 0, DnsProxyThread, NULL, 0, NULL);
   MH_EnableHook(MH_ALL_HOOKS);
-  NetLog("[Init] Hooks installed successfully (PID: %d, proxy: %s://%s:%d, direct domains: %d, direct IP rules: %d)",
+  NetLog("[Init] Hooks installed successfully (PID: %d, proxy: %s://%s:%d, dns: %s, dns_server: %s:%d, dns_ipv6: %s, direct domains: %d, direct IP rules: %d)",
          GetCurrentProcessId(), g_ProxyType == ProxyType::Socks5 ? "socks5" : "http",
-         g_ProxyIP.c_str(), g_ProxyPort, (int)g_DirectDomains.size(), (int)g_DirectIpRules.size());
+         g_ProxyIP.c_str(), g_ProxyPort, g_DnsMode == DnsMode::Proxy ? "proxy" : "system",
+         g_DnsServerIP.c_str(), g_DnsServerPort, g_DnsIpv6 ? "on" : "off",
+         (int)g_DirectDomains.size(), (int)g_DirectIpRules.size());
   } __except(EXCEPTION_EXECUTE_HANDLER) {
     // Silently absorb any crash during initialization
     // This prevents crashing the host process (e.g., Chrome Network Service)
+  }
+  return 0;
+}
+
+DWORD WINAPI CleanupThread(LPVOID lpParam) {
+  g_Running.store(false);
+  MH_DisableHook(MH_ALL_HOOKS);
+  MH_Uninitialize();
+  if (g_DnsProxyUdpSocket != INVALID_SOCKET) {
+    closesocket(g_DnsProxyUdpSocket);
+    g_DnsProxyUdpSocket = INVALID_SOCKET;
+    g_DnsProxyPort = 0;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_DnsPoolMutex);
+    for (auto &conn : g_DnsPool) closesocket(conn.sock);
+    g_DnsPool.clear();
+  }
+  if (g_LogSocket != INVALID_SOCKET) {
+    closesocket(g_LogSocket);
+    g_LogSocket = INVALID_SOCKET;
   }
   return 0;
 }
@@ -1554,6 +1708,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
   if (reason == DLL_PROCESS_ATTACH) {
     DisableThreadLibraryCalls(hModule);
     CreateThread(NULL, 0, SetupThread, NULL, 0, NULL);
+  } else if (reason == DLL_PROCESS_DETACH) {
+    CleanupThread(NULL);
   }
   return TRUE;
 }
