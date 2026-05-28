@@ -28,7 +28,7 @@ jobs:
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
 
-      - name: Package
+      - name: Package core CLI
         shell: pwsh
         run: |
           $dist = "dist"
@@ -39,14 +39,50 @@ jobs:
           Copy-Item "README.md" $dist
           Compress-Archive -Path "$dist\*" -DestinationPath "ghost-proxifier-windows-x64.zip" -Force
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Prepare Tauri resources
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "bin" | Out-Null
+          Copy-Item "build\${{ env.BUILD_TYPE }}\ghost-proxifier.exe" "bin\ghost-proxifier.exe" -Force
+          Copy-Item "build\${{ env.BUILD_TYPE }}\ghost_core.dll" "bin\ghost_core.dll" -Force
+
+      - name: Build Tauri UI
+        run: |
+          npm install
+          npm run tauri -- build
+
+      - name: Package Tauri UI bundles
+        shell: pwsh
+        run: |
+          $bundleDir = "src-tauri\target\release\bundle"
+          if (Test-Path $bundleDir) {
+            Compress-Archive -Path "$bundleDir\*" -DestinationPath "ghost-proxifier-tauri-ui-windows-x64.zip" -Force
+          } else {
+            Write-Error "Tauri bundle directory not found: $bundleDir"
+          }
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ghost-proxifier-windows-x64
           path: ghost-proxifier-windows-x64.zip
 
+      - name: Upload Tauri UI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghost-proxifier-tauri-ui-windows-x64
+          path: ghost-proxifier-tauri-ui-windows-x64.zip
+
       - name: Create GitHub Release
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,8 +90,12 @@ jobs:
           if ($env:GITHUB_REF -like 'refs/tags/*') {
             $tag = $env:GITHUB_REF_NAME
           } else {
-            $tag = "build-$env:GITHUB_RUN_NUMBER"
-            git tag $tag
-            git push origin $tag
+            $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+            $tag = "build-$env:GITHUB_RUN_NUMBER-$shortSha"
           }
-          gh release create $tag "ghost-proxifier-windows-x64.zip" --title "Ghost Proxifier $tag" --notes "Automated Windows x64 build."
+          gh release create $tag `
+            "ghost-proxifier-windows-x64.zip" `
+            "ghost-proxifier-tauri-ui-windows-x64.zip" `
+            --target "$env:GITHUB_SHA" `
+            --title "Ghost Proxifier $tag" `
+            --notes "Automated Windows x64 build with Tauri UI."
