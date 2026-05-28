@@ -1,0 +1,61 @@
+﻿name: Build and Release
+
+on:
+  push:
+    branches: [ master, main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure CMake
+        run: cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $dist = "dist"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "build\${{ env.BUILD_TYPE }}\ghost-proxifier.exe" $dist
+          Copy-Item "build\${{ env.BUILD_TYPE }}\ghost_core.dll" $dist
+          Copy-Item "ghost.conf.example" $dist
+          Copy-Item "README.md" $dist
+          Compress-Archive -Path "$dist\*" -DestinationPath "ghost-proxifier-windows-x64.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghost-proxifier-windows-x64
+          path: ghost-proxifier-windows-x64.zip
+
+      - name: Create GitHub Release
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $tag = $env:GITHUB_REF_NAME
+          } else {
+            $tag = "build-$env:GITHUB_RUN_NUMBER"
+            git tag $tag
+            git push origin $tag
+          }
+          gh release create $tag "ghost-proxifier-windows-x64.zip" --title "Ghost Proxifier $tag" --notes "Automated Windows x64 build."
