@@ -1,5 +1,6 @@
 #include <winsock2.h>
 #include <windows.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <algorithm>
@@ -14,6 +15,106 @@
 #include <fcntl.h>
 
 #pragma comment(lib, "ws2_32.lib")
+
+#define WM_TRAYICON (WM_APP + 1)
+#define ID_TRAY_RESTORE 1001
+#define ID_TRAY_EXIT 1002
+
+static HWND g_trayWnd = NULL;
+static NOTIFYICONDATAA g_trayIcon = {};
+static bool g_trayEnabled = true;
+
+void RestoreConsoleFromTray() {
+  HWND console = GetConsoleWindow();
+  if (console) {
+    ShowWindow(console, SW_SHOW);
+    ShowWindow(console, SW_RESTORE);
+    SetForegroundWindow(console);
+  }
+}
+
+void HideConsoleToTray() {
+  HWND console = GetConsoleWindow();
+  if (console) ShowWindow(console, SW_HIDE);
+}
+
+void RemoveTrayIcon() {
+  if (g_trayIcon.cbSize) Shell_NotifyIconA(NIM_DELETE, &g_trayIcon);
+}
+
+LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+  switch (msg) {
+    case WM_CREATE:
+      SetTimer(hwnd, 1, 500, NULL);
+      return 0;
+    case WM_TIMER: {
+      HWND console = GetConsoleWindow();
+      if (console && IsIconic(console)) HideConsoleToTray();
+      return 0;
+    }
+    case WM_TRAYICON:
+      if (lParam == WM_LBUTTONDBLCLK) {
+        RestoreConsoleFromTray();
+      } else if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
+        POINT pt;
+        GetCursorPos(&pt);
+        HMENU menu = CreatePopupMenu();
+        AppendMenuA(menu, MF_STRING, ID_TRAY_RESTORE, "Open");
+        AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+        AppendMenuA(menu, MF_STRING, ID_TRAY_EXIT, "Exit");
+        SetForegroundWindow(hwnd);
+        TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+        DestroyMenu(menu);
+      }
+      return 0;
+    case WM_COMMAND:
+      switch (LOWORD(wParam)) {
+        case ID_TRAY_RESTORE:
+          RestoreConsoleFromTray();
+          return 0;
+        case ID_TRAY_EXIT:
+          RemoveTrayIcon();
+          ExitProcess(0);
+          return 0;
+      }
+      break;
+    case WM_DESTROY:
+      RemoveTrayIcon();
+      PostQuitMessage(0);
+      return 0;
+  }
+  return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+void TrayThread() {
+  HINSTANCE hInst = GetModuleHandleA(NULL);
+  const char *cls = "GhostProxifierTrayWindow";
+  WNDCLASSA wc = {};
+  wc.lpfnWndProc = TrayWndProc;
+  wc.hInstance = hInst;
+  wc.lpszClassName = cls;
+  RegisterClassA(&wc);
+
+  g_trayWnd = CreateWindowExA(0, cls, "Ghost Proxifier", WS_OVERLAPPED,
+                              0, 0, 0, 0, NULL, NULL, hInst, NULL);
+  if (!g_trayWnd) return;
+
+  g_trayIcon = {};
+  g_trayIcon.cbSize = sizeof(g_trayIcon);
+  g_trayIcon.hWnd = g_trayWnd;
+  g_trayIcon.uID = 1;
+  g_trayIcon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+  g_trayIcon.uCallbackMessage = WM_TRAYICON;
+  g_trayIcon.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+  strcpy_s(g_trayIcon.szTip, "Ghost Proxifier");
+  Shell_NotifyIconA(NIM_ADD, &g_trayIcon);
+
+  MSG m;
+  while (GetMessageA(&m, NULL, 0, 0) > 0) {
+    TranslateMessage(&m);
+    DispatchMessageA(&m);
+  }
+}
 
 void PrintHelp() {
   std::cout << "========================================================="
@@ -36,6 +137,8 @@ void PrintHelp() {
   std::cout << "                   Config can define process=, proxy=/socks5=, direct_domain=, direct_ip=." << std::endl;
   std::cout << "  --watch          Keep scanning and inject into new matching processes."
             << std::endl;
+  std::cout << "  --no-tray        Disable system tray icon/minimize-to-tray behavior."
+            << std::endl;
   std::cout << "  -l, --log-only   Start log server only, skip injection."
             << std::endl;
   std::cout << "  -s, --status     List all processes with ghost_core.dll injected."
@@ -43,6 +146,7 @@ void PrintHelp() {
   std::cout << "  -h, --help, /help, /?  Show this help message." << std::endl;
   std::cout << std::endl;
   std::cout << "Examples:" << std::endl;
+  std::cout << "  ghost-proxifier.exe                         (double-click: ghost.conf + --watch)" << std::endl;
   std::cout << "  ghost-proxifier.exe -p chrome -u 127.0.0.1:2080 --watch" << std::endl;
   std::cout << "  ghost-proxifier.exe -c ghost.conf --watch" << std::endl;
   std::cout << "  ghost-proxifier.exe -p 5188 -u socks5://127.0.0.1:1080" << std::endl;
@@ -270,10 +374,6 @@ std::string FullPath(const std::string &path) {
 int main(int argc, char *argv[]) {
   SetConsoleOutputCP(CP_UTF8);
   SetConsoleCP(CP_UTF8);
-  if (argc == 1) {
-    PrintHelp();
-    return 0;
-  }
 
   std::vector<DWORD> injectedPids;
 
@@ -285,6 +385,7 @@ int main(int argc, char *argv[]) {
   bool watchMode = false;
   bool logOnly = false;
   bool statusMode = false;
+  bool defaultDoubleClickMode = (argc == 1);
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0 ||
@@ -312,6 +413,16 @@ int main(int argc, char *argv[]) {
       logOnly = true;
     else if (strcmp(argv[i], "--status") == 0 || strcmp(argv[i], "-s") == 0)
       statusMode = true;
+    else if (strcmp(argv[i], "--no-tray") == 0)
+      g_trayEnabled = false;
+  }
+
+  if (defaultDoubleClickMode) {
+    watchMode = true;
+  }
+
+  if (g_trayEnabled && !statusMode) {
+    std::thread(TrayThread).detach();
   }
 
   std::string exeDir = GetExeDir();
@@ -324,6 +435,7 @@ int main(int argc, char *argv[]) {
   LoadInjectorConfigTargets(configReadPath, targets, upstream);
 
   const char *dllName = "ghost_core.dll";
+  std::string dllPath = exeDir + "\\ghost_core.dll";
 
   if (statusMode) {
     ListInjectedProcesses(dllName);
@@ -342,13 +454,23 @@ int main(int argc, char *argv[]) {
   }
 
   if (targets.empty()) {
-    std::cout << "[Injector] no target process need inject." << std::endl;
+    std::cout << "[Injector] no target process need inject. Set process= in ghost.conf or use -p <name|pid>." << std::endl;
+    if (defaultDoubleClickMode) {
+      std::cout << "[Injector] Double-click mode used: " << configReadPath << " + --watch." << std::endl;
+      std::cout << "[Injector] Press Ctrl+C or use tray menu Exit to quit." << std::endl;
+      while (true) Sleep(10000);
+    }
     return 0;
   }
 
   if (upstream.empty()) {
     std::cout << "[Error] Upstream proxy is required. Set -u <addr:port> or proxy=<addr:port> in ghost.conf." << std::endl;
-    PrintHelp();
+    if (!defaultDoubleClickMode) PrintHelp();
+    else {
+      std::cout << "[Injector] Double-click mode used: " << configReadPath << " + --watch." << std::endl;
+      std::cout << "[Injector] Press Ctrl+C or use tray menu Exit to quit." << std::endl;
+      while (true) Sleep(10000);
+    }
     return 1;
   }
 
@@ -382,7 +504,11 @@ int main(int argc, char *argv[]) {
             << " Targets: " << targets.size()
             << " Config: " << configReadPath
             << " RuntimeConfig: " << runtimeConfigPath
-            << " Watch: " << (watchMode ? "ON" : "OFF") << std::endl;
+            << " Watch: " << (watchMode ? "ON" : "OFF")
+            << " Tray: " << (g_trayEnabled ? "ON" : "OFF") << std::endl;
+  if (defaultDoubleClickMode) {
+    std::cout << "[Injector] Double-click mode: loaded ghost.conf and enabled --watch automatically." << std::endl;
+  }
 
   int totalInjected = 0;
   do {
@@ -391,7 +517,7 @@ int main(int argc, char *argv[]) {
       if (IsNumber(t)) {
         DWORD pid = (DWORD)std::stoul(t);
         if (!IsDllLoaded(pid, dllName)) {
-          if (Inject(pid, dllName)) {
+          if (Inject(pid, dllPath.c_str())) {
             std::cout << "[+] Injected into PID: " << pid << std::endl;
             currentRoundInjected++;
           }
@@ -422,7 +548,7 @@ int main(int argc, char *argv[]) {
 
         if (shouldInject) {
           if (!IsDllLoaded(pe.th32ProcessID, dllName)) {
-            if (Inject(pe.th32ProcessID, dllName)) {
+            if (Inject(pe.th32ProcessID, dllPath.c_str())) {
               std::cout << "[+] Injected: " << pe.th32ProcessID << " ("
                         << pe.szExeFile << ")" << std::endl;
               currentRoundInjected++;

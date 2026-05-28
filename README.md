@@ -374,3 +374,12 @@ SOCKS5 handshakes are now completed before the first `send`, `WSASend`, `recv`, 
 Note: the injected DLL always loads `ghost.conf` from the directory that contains `ghost_core.dll`. When `-c <file>` or `-u <proxy>` is used, the injector writes/copies the runtime config to that directory before injection.
 
 Domains in direct rules use system DNS and direct sockets, so they can go through your normal LAN/VPN route instead of the upstream proxy.
+
+## Double-click and system tray
+
+- Put `ghost-proxifier.exe`, `ghost_core.dll`, and `ghost.conf` in the same directory, then double-click `ghost-proxifier.exe` to start.
+- When started with no arguments, it automatically reads `ghost.conf` and enables `--watch`.
+- A `Ghost Proxifier` icon is added to the Windows system tray.
+- Minimize the console window to hide it to the tray; double-click the tray icon to restore it.
+- Right-click the tray icon to choose `Open` or `Exit`.
+- Use `--no-tray` to disable the tray icon/minimize-to-tray behavior.
