@@ -11,6 +11,9 @@
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
 
 #pragma comment(lib, "ws2_32.lib")
 #include "MinHook.h"
@@ -74,6 +77,15 @@ gethostbyname_t real_gethostbyname = NULL;
 
 std::string g_ProxyIP = "127.0.0.1";
 int g_ProxyPort = 2080;
+
+struct DirectIpRule {
+  DWORD network; // network byte order
+  DWORD mask;    // network byte order
+  std::string text;
+};
+
+std::vector<std::string> g_DirectDomains;
+std::vector<DirectIpRule> g_DirectIpRules;
 SOCKET g_DnsProxyUdpSocket = INVALID_SOCKET;
 int g_DnsProxyPort = 0;
 
@@ -218,6 +230,132 @@ void NetLog(const char *format, ...) {
   }
 }
 
+std::string Trim(const std::string &s) {
+  size_t b = 0;
+  while (b < s.size() && std::isspace((unsigned char)s[b])) b++;
+  size_t e = s.size();
+  while (e > b && std::isspace((unsigned char)s[e - 1])) e--;
+  return s.substr(b, e - b);
+}
+
+std::string ToLower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+  return s;
+}
+
+bool ParseProxyAddress(const std::string &value, std::string &host, int &port) {
+  std::string v = Trim(value);
+  if (v.empty()) return false;
+  size_t pos = v.rfind(':');
+  if (pos == std::string::npos || pos == 0 || pos + 1 >= v.size()) return false;
+  host = Trim(v.substr(0, pos));
+  std::string portText = Trim(v.substr(pos + 1));
+  try {
+    int p = std::stoi(portText);
+    if (p <= 0 || p > 65535 || host.empty()) return false;
+    port = p;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+void AddDirectDomain(const std::string &value) {
+  std::string v = ToLower(Trim(value));
+  if (v.empty()) return;
+  if (v.rfind("domain:", 0) == 0) v = Trim(v.substr(7));
+  if (v.rfind("*.", 0) == 0) v = v.substr(2);
+  if (!v.empty() && v[0] == '.') v = v.substr(1);
+  if (!v.empty()) g_DirectDomains.push_back(v);
+}
+
+void AddDirectIpRule(const std::string &value) {
+  std::string v = ToLower(Trim(value));
+  if (v.empty()) return;
+  if (v.rfind("ip:", 0) == 0) v = Trim(v.substr(3));
+  size_t slash = v.find('/');
+  std::string ipText = (slash == std::string::npos) ? v : v.substr(0, slash);
+  int prefix = 32;
+  if (slash != std::string::npos) {
+    try { prefix = std::stoi(v.substr(slash + 1)); } catch (...) { return; }
+  }
+  if (prefix < 0 || prefix > 32) return;
+  in_addr addr;
+  if (inet_pton(AF_INET, ipText.c_str(), &addr) != 1) return;
+  DWORD hostMask = (prefix == 0) ? 0 : (0xFFFFFFFFu << (32 - prefix));
+  DWORD mask = htonl(hostMask);
+  DirectIpRule rule;
+  rule.network = addr.s_addr & mask;
+  rule.mask = mask;
+  rule.text = v;
+  g_DirectIpRules.push_back(rule);
+}
+
+bool LooksLikeIpOrCidr(const std::string &v) {
+  std::string x = v;
+  if (x.rfind("ip:", 0) == 0) x = x.substr(3);
+  size_t slash = x.find('/');
+  if (slash != std::string::npos) x = x.substr(0, slash);
+  in_addr addr;
+  return inet_pton(AF_INET, Trim(x).c_str(), &addr) == 1;
+}
+
+void AddDirectRule(const std::string &value) {
+  std::stringstream ss(value);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    item = Trim(item);
+    if (item.empty()) continue;
+    std::string lower = ToLower(item);
+    if (lower.rfind("domain:", 0) == 0) AddDirectDomain(item);
+    else if (LooksLikeIpOrCidr(lower)) AddDirectIpRule(item);
+    else AddDirectDomain(item);
+  }
+}
+
+bool CurrentProcessMatchesSection(const std::string &sectionName) {
+  std::string s = ToLower(Trim(sectionName));
+  const std::string prefix = "process:";
+  if (s.rfind(prefix, 0) != 0) return false;
+  std::string target = Trim(s.substr(prefix.size()));
+  if (target.empty()) return false;
+
+  char exePath[MAX_PATH] = {0};
+  GetModuleFileNameA(NULL, exePath, MAX_PATH);
+  std::string exe = exePath;
+  size_t last = exe.find_last_of("\\/");
+  if (last != std::string::npos) exe = exe.substr(last + 1);
+  exe = ToLower(exe);
+  std::string base = exe;
+  if (base.size() > 4 && base.substr(base.size() - 4) == ".exe") base = base.substr(0, base.size() - 4);
+
+  DWORD pid = GetCurrentProcessId();
+  if (std::all_of(target.begin(), target.end(), [](unsigned char c) { return std::isdigit(c); })) {
+    try { return (DWORD)std::stoul(target) == pid; } catch (...) { return false; }
+  }
+  if (target == exe || target == base) return true;
+  if (target.size() > 4 && target.substr(target.size() - 4) == ".exe") return target == exe;
+  return false;
+}
+
+void ApplyConfigKey(const std::string &key, const std::string &value) {
+  std::string k = ToLower(Trim(key));
+  std::string v = Trim(value);
+  if (k == "proxy" || k == "upstream") {
+    std::string host; int port = 0;
+    if (ParseProxyAddress(v, host, port)) {
+      g_ProxyIP = host;
+      g_ProxyPort = port;
+    }
+  } else if (k == "direct" || k == "bypass") {
+    AddDirectRule(v);
+  } else if (k == "direct_domain" || k == "bypass_domain") {
+    AddDirectDomain(v);
+  } else if (k == "direct_ip" || k == "bypass_ip") {
+    AddDirectIpRule(v);
+  }
+}
+
 void LoadConfig() {
   char path[MAX_PATH];
   GetModuleFileNameA(GetModuleHandleA("ghost_core.dll"), path, MAX_PATH);
@@ -226,17 +364,72 @@ void LoadConfig() {
   std::string confPath =
       (last != std::string::npos ? p.substr(0, last) : ".") + "\\ghost.conf";
   std::ifstream f(confPath);
-  if (f.is_open()) {
-    std::string line;
-    if (std::getline(f, line)) {
-      size_t pos = line.find(':');
-      if (pos != std::string::npos) {
-        g_ProxyIP = line.substr(0, pos);
-        g_ProxyPort = std::stoi(line.substr(pos + 1));
+  if (!f.is_open()) return;
+
+  bool legacyFirstLine = true;
+  bool inMatchingProcessSection = false;
+  bool inGlobalSection = true;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    std::string trimmed = Trim(line);
+    if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == ';') continue;
+
+    // Backward-compatible legacy config: first non-comment line is addr:port.
+    if (legacyFirstLine && trimmed.find('=') == std::string::npos && trimmed.front() != '[') {
+      std::string host; int port = 0;
+      if (ParseProxyAddress(trimmed, host, port)) {
+        g_ProxyIP = host;
+        g_ProxyPort = port;
       }
+      legacyFirstLine = false;
+      continue;
     }
-    f.close();
+    legacyFirstLine = false;
+
+    if (trimmed.front() == '[' && trimmed.back() == ']') {
+      std::string sec = trimmed.substr(1, trimmed.size() - 2);
+      std::string lowerSec = ToLower(Trim(sec));
+      inGlobalSection = (lowerSec == "global" || lowerSec == "default");
+      inMatchingProcessSection = CurrentProcessMatchesSection(sec);
+      continue;
+    }
+
+    size_t eq = trimmed.find('=');
+    if (eq == std::string::npos) continue;
+    if (inGlobalSection || inMatchingProcessSection) {
+      ApplyConfigKey(trimmed.substr(0, eq), trimmed.substr(eq + 1));
+    }
   }
+}
+
+bool IsDirectDomain(const std::string &domain) {
+  std::string d = ToLower(Trim(domain));
+  if (!d.empty() && d.back() == '.') d.pop_back();
+  if (d.empty()) return false;
+  for (const auto &rule : g_DirectDomains) {
+    if (d == rule) return true;
+    if (d.size() > rule.size() && d.compare(d.size() - rule.size(), rule.size(), rule) == 0 &&
+        d[d.size() - rule.size() - 1] == '.') return true;
+  }
+  return false;
+}
+
+bool IsDirectIp(DWORD net_ip) {
+  for (const auto &rule : g_DirectIpRules) {
+    if ((net_ip & rule.mask) == rule.network) return true;
+  }
+  return false;
+}
+
+bool ShouldDirectConnect(const char *ip, int port, const std::string &domain, int family, bool is_local) {
+  if (is_local || port == g_ProxyPort || port == 9999) return true;
+  if (!domain.empty() && IsDirectDomain(domain)) return true;
+  if (family == AF_INET) {
+    in_addr addr;
+    if (inet_pton(AF_INET, ip, &addr) == 1 && IsDirectIp(addr.s_addr)) return true;
+  }
+  return false;
 }
 
 std::string GetDnsName(const char *buf, int &offset, int total_len) {
@@ -696,7 +889,7 @@ BOOL PASCAL hook_ConnectEx(SOCKET s, const struct sockaddr *name, int namelen,
       WSASetLastError(WSAECONNREFUSED);
       return FALSE;
     }
-    if (!is_local && port != g_ProxyPort && port != 9999) {
+    if (!ShouldDirectConnect(ip, port, domain, name->sa_family, is_local)) {
       NetLog("[hook] ConnectEx: %s:%d | %s", ip, port, domain.c_str());
       // Save target info + initial data for deferred handshake
       PendingProxy pp = {ip, port, name->sa_family, domain, {}};
@@ -746,7 +939,7 @@ int WINAPI hook_WSAConnect(SOCKET s, const sockaddr *name, int namelen,
       WSASetLastError(WSAECONNREFUSED);
       return SOCKET_ERROR;
     }
-    if (!is_local && port != g_ProxyPort && port != 9999) {
+    if (!ShouldDirectConnect(ip, port, domain, name->sa_family, is_local)) {
       NetLog("[hook] WSAConnect: %s:%d | %s", ip, port, domain.c_str());
       // Save target info for deferred HTTP CONNECT handshake
       {
@@ -799,7 +992,7 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
       WSASetLastError(WSAECONNREFUSED);
       return SOCKET_ERROR;
     }
-    if (!is_local && port != g_ProxyPort && port != 9999) {
+    if (!ShouldDirectConnect(ip, port, domain, name->sa_family, is_local)) {
       NetLog("[hook] connect: %s:%d | %s", ip, port, domain.c_str());
       // Save target info for deferred HTTP CONNECT handshake
       {
@@ -991,6 +1184,19 @@ INT WSAAPI hook_getaddrinfo(PCSTR pNodeName, PCSTR pServiceName, const ADDRINFOA
     }
     std::string domain = pNodeName;
     if (!domain.empty() && domain.back() == '.') domain.pop_back();
+    if (IsDirectDomain(domain)) {
+        NetLog("[Direct] getaddrinfo: %s uses system DNS", domain.c_str());
+        INT ret = real_getaddrinfo(pNodeName, pServiceName, pHints, ppResult);
+        if (ret == 0 && ppResult && *ppResult) {
+            for (ADDRINFOA *ptr = *ppResult; ptr != NULL; ptr = ptr->ai_next) {
+                if (ptr->ai_family == AF_INET) {
+                    sockaddr_in *ipv4 = (sockaddr_in *)ptr->ai_addr;
+                    RecordIpDomainMapping(ipv4->sin_addr.s_addr, domain);
+                }
+            }
+        }
+        return ret;
+    }
     std::vector<DWORD> ips = ProxyDnsResolve(domain.c_str());
     if (!ips.empty()) {
         // Use first resolved IP to call real function (no actual DNS happens)
@@ -1037,6 +1243,19 @@ INT WSAAPI hook_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRIN
     }
     std::string domain = ascii_node;
     if (!domain.empty() && domain.back() == '.') domain.pop_back();
+    if (IsDirectDomain(domain)) {
+        NetLog("[Direct] GetAddrInfoW: %s uses system DNS", domain.c_str());
+        INT ret = real_GetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+        if (ret == 0 && ppResult && *ppResult) {
+            for (ADDRINFOW *ptr = *ppResult; ptr != NULL; ptr = ptr->ai_next) {
+                if (ptr->ai_family == AF_INET) {
+                    sockaddr_in *ipv4 = (sockaddr_in *)ptr->ai_addr;
+                    RecordIpDomainMapping(ipv4->sin_addr.s_addr, domain);
+                }
+            }
+        }
+        return ret;
+    }
     std::vector<DWORD> ips = ProxyDnsResolve(domain.c_str());
     if (!ips.empty()) {
         struct in_addr first_addr;
@@ -1079,6 +1298,18 @@ struct hostent* WSAAPI hook_gethostbyname(const char *name) {
     }
     std::string domain = name;
     if (!domain.empty() && domain.back() == '.') domain.pop_back();
+    if (IsDirectDomain(domain)) {
+        NetLog("[Direct] gethostbyname: %s uses system DNS", domain.c_str());
+        struct hostent* ret = real_gethostbyname(name);
+        if (ret) {
+            for (int i = 0; ret->h_addr_list[i] != 0; ++i) {
+                struct in_addr addr;
+                memcpy(&addr, ret->h_addr_list[i], sizeof(struct in_addr));
+                RecordIpDomainMapping(addr.s_addr, domain);
+            }
+        }
+        return ret;
+    }
     std::vector<DWORD> ips = ProxyDnsResolve(domain.c_str());
     if (!ips.empty()) {
         // Record all IP-domain mappings
@@ -1167,7 +1398,7 @@ DWORD WINAPI SetupThread(LPVOID lpParam) {
                   (void **)&real_WSARecvFrom);
   CreateThread(NULL, 0, DnsProxyThread, NULL, 0, NULL);
   MH_EnableHook(MH_ALL_HOOKS);
-  NetLog("[Init] Hooks installed successfully (PID: %d)", GetCurrentProcessId());
+  NetLog("[Init] Hooks installed successfully (PID: %d, proxy: %s:%d, direct domains: %d, direct IP rules: %d)", GetCurrentProcessId(), g_ProxyIP.c_str(), g_ProxyPort, (int)g_DirectDomains.size(), (int)g_DirectIpRules.size());
   } __except(EXCEPTION_EXECUTE_HANDLER) {
     // Silently absorb any crash during initialization
     // This prevents crashing the host process (e.g., Chrome Network Service)

@@ -297,3 +297,71 @@ ghost-proxifier/
 ## License
 
 MIT
+
+---
+
+## Configuration: multiple processes and direct rules
+
+`ghost-proxifier.exe` now supports reading `ghost.conf` to decide which processes to inject, which upstream proxy to use, and which domains/IP ranges should be connected directly without HTTP CONNECT.
+
+### Basic example
+
+Create `ghost.conf` beside `ghost-proxifier.exe` and `ghost_core.dll`:
+
+```ini
+[global]
+proxy=127.0.0.1:2080
+process=chrome.exe
+process=msedge.exe
+process=Code.exe
+
+# Direct connection rules. Subdomains are matched automatically.
+direct_domain=*.corp.example.com
+direct_domain=intranet.local
+direct_ip=10.0.0.0/8
+direct_ip=172.16.0.0/12
+direct_ip=192.168.0.0/16
+```
+
+Run:
+
+```powershell
+.\ghost-proxifier.exe -c .\ghost.conf --watch
+```
+
+### Per-process proxy example
+
+A process-specific section can override the global proxy and add extra direct rules. The section name may use either process name or PID.
+
+```ini
+[global]
+proxy=127.0.0.1:2080
+process=chrome.exe
+process=Code.exe
+
+direct_ip=10.0.0.0/8
+direct_domain=*.company.local
+
+[process:chrome.exe]
+proxy=127.0.0.1:2080
+direct_domain=accounts.company.local
+
+[process:Code.exe]
+proxy=127.0.0.1:2081
+direct_ip=192.168.50.0/24
+
+[process:12345]
+proxy=127.0.0.1:2082
+```
+
+Rules:
+
+- `process=` can be repeated or comma-separated, for example `process=chrome.exe,msedge.exe`.
+- `[process:<name-or-pid>]` also marks that process as an injection target.
+- `proxy=` / `upstream=` accepts an HTTP CONNECT proxy address, for example `127.0.0.1:2080`.
+- `direct_domain=` / `bypass_domain=` matches the exact domain and all subdomains. `*.example.com`, `.example.com`, and `example.com` are treated as the same suffix rule.
+- `direct_ip=` / `bypass_ip=` supports IPv4 or CIDR, for example `192.168.1.25` or `192.168.0.0/16`.
+- `direct=` / `bypass=` accepts a comma-separated mixed list, for example `direct=*.local,10.0.0.0/8,192.168.1.2`.
+- The old single-line format is still accepted: `127.0.0.1:2080`.
+
+Domains in direct rules use system DNS and direct sockets, so they can go through your normal LAN/VPN route instead of the upstream proxy.

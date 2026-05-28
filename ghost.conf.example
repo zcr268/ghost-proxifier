@@ -1,0 +1,21 @@
+﻿# Ghost Proxifier config example
+# Put this file as ghost.conf next to ghost-proxifier.exe and ghost_core.dll.
+
+[global]
+proxy=127.0.0.1:2080
+process=chrome.exe
+process=msedge.exe
+process=Code.exe
+
+# Direct connection rules: use normal LAN/VPN route instead of HTTP CONNECT proxy.
+direct_domain=*.corp.example.com
+direct_domain=intranet.local
+direct_ip=10.0.0.0/8
+direct_ip=172.16.0.0/12
+direct_ip=192.168.0.0/16
+
+# Optional per-process override.
+[process:Code.exe]
+proxy=127.0.0.1:2081
+direct_domain=api.internal.test
+direct_ip=192.168.50.0/24

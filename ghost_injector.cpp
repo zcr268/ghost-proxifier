@@ -8,6 +8,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <sstream>
+#include <cctype>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -26,8 +28,10 @@ void PrintHelp() {
   std::cout << "                   Can be specified multiple times. With --watch, child processes are also injected."
             << std::endl;
   std::cout
-      << "  -u <addr:port>   Set upstream HTTP CONNECT proxy (Required, e.g., 127.0.0.1:2080)."
+      << "  -u <addr:port>   Set upstream HTTP CONNECT proxy (e.g., 127.0.0.1:2080)."
       << std::endl;
+  std::cout << "  -c <file>        Read config file (default: ghost.conf)." << std::endl;
+  std::cout << "                   Config can define process=, proxy=, direct_domain=, direct_ip=." << std::endl;
   std::cout << "  --watch          Keep scanning and inject into new matching processes."
             << std::endl;
   std::cout << "  -l, --log-only   Start log server only, skip injection."
@@ -38,6 +42,7 @@ void PrintHelp() {
   std::cout << std::endl;
   std::cout << "Examples:" << std::endl;
   std::cout << "  ghost-proxifier.exe -p chrome -u 127.0.0.1:2080 --watch" << std::endl;
+  std::cout << "  ghost-proxifier.exe -c ghost.conf --watch" << std::endl;
   std::cout << "  ghost-proxifier.exe -p 5188 -u 192.168.1.10:1080" << std::endl;
   std::cout << "  ghost-proxifier.exe -s" << std::endl;
   std::cout << "  ghost-proxifier.exe -l" << std::endl;
@@ -168,6 +173,74 @@ bool IsNumber(const std::string &s) {
   return !s.empty() && std::all_of(s.begin(), s.end(), ::isdigit);
 }
 
+std::string Trim(const std::string &s) {
+  size_t b = 0;
+  while (b < s.size() && std::isspace((unsigned char)s[b])) b++;
+  size_t e = s.size();
+  while (e > b && std::isspace((unsigned char)s[e - 1])) e--;
+  return s.substr(b, e - b);
+}
+
+std::string ToLower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+  return s;
+}
+
+void NormalizeAndAddTarget(std::vector<std::string> &targets, std::string target) {
+  target = Trim(target);
+  if (target.empty()) return;
+  if (!IsNumber(target)) {
+    std::string lower = ToLower(target);
+    if (lower.size() < 4 || lower.substr(lower.size() - 4) != ".exe")
+      target += ".exe";
+  }
+  if (std::find(targets.begin(), targets.end(), target) == targets.end()) targets.push_back(target);
+}
+
+void LoadInjectorConfigTargets(const std::string &configPath, std::vector<std::string> &targets, std::string &upstream) {
+  std::ifstream f(configPath);
+  if (!f.is_open()) return;
+  std::string line;
+  bool first = true;
+  while (std::getline(f, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    std::string t = Trim(line);
+    if (t.empty() || t[0] == '#' || t[0] == ';') continue;
+    if (first && t.find('=') == std::string::npos && t.front() != '[') {
+      if (upstream.empty()) upstream = t;
+      first = false;
+      continue;
+    }
+    first = false;
+    if (t.front() == '[' && t.back() == ']') {
+      std::string sec = Trim(t.substr(1, t.size() - 2));
+      std::string lower = ToLower(sec);
+      const std::string prefix = "process:";
+      if (lower.rfind(prefix, 0) == 0) NormalizeAndAddTarget(targets, sec.substr(prefix.size()));
+      continue;
+    }
+    size_t eq = t.find('=');
+    if (eq == std::string::npos) continue;
+    std::string key = ToLower(Trim(t.substr(0, eq)));
+    std::string value = Trim(t.substr(eq + 1));
+    if ((key == "proxy" || key == "upstream") && upstream.empty()) upstream = value;
+    else if (key == "process" || key == "target") {
+      std::stringstream ss(value);
+      std::string item;
+      while (std::getline(ss, item, ',')) NormalizeAndAddTarget(targets, item);
+    }
+  }
+}
+
+bool CopyTextFile(const std::string &src, const std::string &dst) {
+  std::ifstream in(src, std::ios::binary);
+  if (!in.is_open()) return false;
+  std::ofstream out(dst, std::ios::binary);
+  if (!out.is_open()) return false;
+  out << in.rdbuf();
+  return true;
+}
+
 int main(int argc, char *argv[]) {
   if (argc == 1) {
     PrintHelp();
@@ -178,6 +251,9 @@ int main(int argc, char *argv[]) {
 
   std::vector<std::string> targets;
   std::string upstream = "";
+  std::string configPath = "ghost.conf";
+  bool upstreamFromCli = false;
+  bool configFromCli = false;
   bool watchMode = false;
   bool logOnly = false;
   bool statusMode = false;
@@ -190,20 +266,18 @@ int main(int argc, char *argv[]) {
       return 0;
     }
     if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-      std::string target = argv[++i];
-      // Auto-append .exe for process names
-      if (!IsNumber(target)) {
-        std::string lower = target;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-        if (lower.size() < 4 || lower.substr(lower.size() - 4) != ".exe")
-          target += ".exe";
-      }
-      targets.push_back(target);
+      NormalizeAndAddTarget(targets, argv[++i]);
     }
     else if ((strcmp(argv[i], "-u") == 0 ||
               strcmp(argv[i], "--upstream") == 0) &&
-             i + 1 < argc)
+             i + 1 < argc) {
       upstream = argv[++i];
+      upstreamFromCli = true;
+    }
+    else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) && i + 1 < argc) {
+      configPath = argv[++i];
+      configFromCli = true;
+    }
     else if (strcmp(argv[i], "--watch") == 0)
       watchMode = true;
     else if (strcmp(argv[i], "--log-only") == 0 || strcmp(argv[i], "-l") == 0)
@@ -211,6 +285,8 @@ int main(int argc, char *argv[]) {
     else if (strcmp(argv[i], "--status") == 0 || strcmp(argv[i], "-s") == 0)
       statusMode = true;
   }
+
+  LoadInjectorConfigTargets(configPath, targets, upstream);
 
   const char *dllName = "ghost_core.dll";
 
@@ -236,18 +312,28 @@ int main(int argc, char *argv[]) {
   }
 
   if (upstream.empty()) {
-    std::cout << "[Error] Upstream proxy (-u <addr:port>) is required." << std::endl;
+    std::cout << "[Error] Upstream proxy is required. Set -u <addr:port> or proxy=<addr:port> in ghost.conf." << std::endl;
     PrintHelp();
     return 1;
   }
 
-  std::ofstream conf("ghost.conf");
-  if (conf.is_open()) {
-    conf << upstream;
-    conf.close();
+  if (configFromCli) {
+    if (configPath != "ghost.conf" && !CopyTextFile(configPath, "ghost.conf")) {
+      std::cout << "[Error] Failed to copy config file to ghost.conf: " << configPath << std::endl;
+      return 1;
+    }
+  } else if (upstreamFromCli) {
+    std::ofstream conf("ghost.conf");
+    if (conf.is_open()) {
+      conf << "proxy=" << upstream << std::endl;
+      for (const auto &t : targets) conf << "process=" << t << std::endl;
+      conf.close();
+    }
   }
 
   std::cout << "[Injector] Ready. Upstream: " << upstream
+            << " Targets: " << targets.size()
+            << " Config: " << configPath
             << " Watch: " << (watchMode ? "ON" : "OFF") << std::endl;
 
   int totalInjected = 0;
