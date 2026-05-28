@@ -15,20 +15,144 @@
 #include <io.h>
 #include <fcntl.h>
 #include <cstdio>
+#include <mutex>
+#include <deque>
+#include <streambuf>
 
 #pragma comment(lib, "ws2_32.lib")
 
 #define WM_TRAYICON (WM_APP + 1)
 #define ID_TRAY_RESTORE 1001
 #define ID_TRAY_EXIT 1002
+#define ID_LOG_CLEAR 1003
+#define ID_LOG_COPY 1004
+#define WM_APPEND_LOG (WM_APP + 2)
 
 static HWND g_trayWnd = NULL;
+static HWND g_logEdit = NULL;
 static NOTIFYICONDATAA g_trayIcon = {};
 static bool g_trayEnabled = true;
 static std::atomic<bool> g_exitRequested{false};
 static WNDPROC g_originalConsoleWndProc = NULL;
+static std::mutex g_pendingLogMutex;
+static std::deque<std::string> g_pendingLogs;
+static std::ofstream g_logFile;
+static std::streambuf *g_oldCoutBuf = nullptr;
+static std::streambuf *g_oldCerrBuf = nullptr;
+
+bool IsGuiBuild() {
+#ifdef GHOST_GUI_BUILD
+  return true;
+#else
+  return false;
+#endif
+}
+
+void AppendLogToUi(const std::string &text);
+
+class UiLogStreamBuf : public std::streambuf {
+ public:
+  explicit UiLogStreamBuf(std::streambuf *fallback) : fallback_(fallback) {}
+ protected:
+  std::streamsize xsputn(const char *s, std::streamsize n) override {
+    if (fallback_) fallback_->sputn(s, n);
+    AppendLogToUi(std::string(s, static_cast<size_t>(n)));
+    return n;
+  }
+  int overflow(int ch) override {
+    if (ch == traits_type::eof()) return traits_type::not_eof(ch);
+    char c = static_cast<char>(ch);
+    if (fallback_) fallback_->sputc(c);
+    AppendLogToUi(std::string(1, c));
+    return ch;
+  }
+  int sync() override {
+    if (fallback_) fallback_->pubsync();
+    if (g_logFile.is_open()) g_logFile.flush();
+    return 0;
+  }
+ private:
+  std::streambuf *fallback_;
+};
+
+static UiLogStreamBuf *g_uiCoutBuf = nullptr;
+static UiLogStreamBuf *g_uiCerrBuf = nullptr;
 
 void HideConsoleToTray();
+void ShowMainWindow();
+
+std::string GetExeDir();
+
+void AppendLogToUi(const std::string &text) {
+  if (text.empty()) return;
+  if (g_logFile.is_open()) {
+    g_logFile << text;
+    g_logFile.flush();
+  }
+  if (!IsGuiBuild()) return;
+  std::string *copy = new std::string(text);
+  HWND target = g_trayWnd;
+  if (target && PostMessageA(target, WM_APPEND_LOG, 0, reinterpret_cast<LPARAM>(copy))) return;
+  {
+    std::lock_guard<std::mutex> lock(g_pendingLogMutex);
+    g_pendingLogs.push_back(*copy);
+    while (g_pendingLogs.size() > 2000) g_pendingLogs.pop_front();
+  }
+  delete copy;
+}
+
+void FlushPendingLogsToEdit() {
+  if (!g_logEdit) return;
+  std::deque<std::string> pending;
+  {
+    std::lock_guard<std::mutex> lock(g_pendingLogMutex);
+    pending.swap(g_pendingLogs);
+  }
+  for (const auto &text : pending) {
+    int len = GetWindowTextLengthA(g_logEdit);
+    SendMessageA(g_logEdit, EM_SETSEL, len, len);
+    SendMessageA(g_logEdit, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text.c_str()));
+  }
+}
+
+void AppendLogTextToEdit(const std::string &text) {
+  if (!g_logEdit) return;
+  int len = GetWindowTextLengthA(g_logEdit);
+  SendMessageA(g_logEdit, EM_SETSEL, len, len);
+  SendMessageA(g_logEdit, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text.c_str()));
+}
+
+void InstallUiLogCapture() {
+  if (!IsGuiBuild() || g_uiCoutBuf) return;
+  std::string logPath = GetExeDir() + "\\ghost-proxifier.log";
+  g_logFile.open(logPath, std::ios::app | std::ios::binary);
+  if (g_logFile.is_open()) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    g_logFile << "\r\n===== Ghost Proxifier started "
+              << st.wYear << "-" << st.wMonth << "-" << st.wDay << " "
+              << st.wHour << ":" << st.wMinute << ":" << st.wSecond
+              << " =====\r\n";
+  }
+  g_oldCoutBuf = std::cout.rdbuf();
+  g_oldCerrBuf = std::cerr.rdbuf();
+  g_uiCoutBuf = new UiLogStreamBuf(g_oldCoutBuf);
+  g_uiCerrBuf = new UiLogStreamBuf(g_oldCerrBuf);
+  std::cout.rdbuf(g_uiCoutBuf);
+  std::cerr.rdbuf(g_uiCerrBuf);
+}
+
+void UninstallUiLogCapture() {
+  if (g_oldCoutBuf) std::cout.rdbuf(g_oldCoutBuf);
+  if (g_oldCerrBuf) std::cerr.rdbuf(g_oldCerrBuf);
+  delete g_uiCoutBuf;
+  delete g_uiCerrBuf;
+  g_uiCoutBuf = nullptr;
+  g_uiCerrBuf = nullptr;
+  g_oldCoutBuf = nullptr;
+  g_oldCerrBuf = nullptr;
+  if (g_logFile.is_open()) g_logFile.close();
+}
 
 LRESULT CALLBACK ConsoleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   if (msg == WM_CLOSE ||
@@ -40,7 +164,13 @@ LRESULT CALLBACK ConsoleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
   return CallWindowProcA(g_originalConsoleWndProc, hwnd, msg, wParam, lParam);
 }
 
-void RestoreConsoleFromTray() {
+void ShowMainWindow() {
+  if (IsGuiBuild() && g_trayWnd) {
+    ShowWindow(g_trayWnd, SW_SHOW);
+    ShowWindow(g_trayWnd, SW_RESTORE);
+    SetForegroundWindow(g_trayWnd);
+    return;
+  }
   HWND console = GetConsoleWindow();
   if (console) {
     ShowWindow(console, SW_SHOW);
@@ -49,7 +179,15 @@ void RestoreConsoleFromTray() {
   }
 }
 
+void RestoreConsoleFromTray() {
+  ShowMainWindow();
+}
+
 void HideConsoleToTray() {
+  if (IsGuiBuild() && g_trayWnd) {
+    ShowWindow(g_trayWnd, SW_HIDE);
+    return;
+  }
   HWND console = GetConsoleWindow();
   if (console) ShowWindow(console, SW_HIDE);
 }
@@ -88,6 +226,7 @@ void RemoveTrayIcon() {
 
 void RequestExit() {
   g_exitRequested.store(true);
+  if (g_trayWnd) PostMessageA(g_trayWnd, WM_CLOSE, 0, 0);
   HWND console = GetConsoleWindow();
   if (console) ShowWindow(console, SW_SHOW);
 }
@@ -106,14 +245,51 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD type) {
   return FALSE;
 }
 
+void CopyAllLogText() {
+  if (!g_logEdit) return;
+  SendMessageA(g_logEdit, EM_SETSEL, 0, -1);
+  SendMessageA(g_logEdit, WM_COPY, 0, 0);
+  int len = GetWindowTextLengthA(g_logEdit);
+  SendMessageA(g_logEdit, EM_SETSEL, len, len);
+}
+
 LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   switch (msg) {
-    case WM_CREATE:
-      SetTimer(hwnd, 1, 500, NULL);
+    case WM_CREATE: {
+      if (IsGuiBuild()) {
+        g_logEdit = CreateWindowExA(
+            WS_EX_CLIENTEDGE, "EDIT", "",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_LEFT | ES_MULTILINE |
+                ES_AUTOVSCROLL | ES_READONLY,
+            0, 0, 0, 0, hwnd, NULL, GetModuleHandleA(NULL), NULL);
+        if (g_logEdit) {
+          SendMessageA(g_logEdit, WM_SETFONT, (WPARAM)GetStockObject(ANSI_FIXED_FONT), TRUE);
+          FlushPendingLogsToEdit();
+        }
+        AppendLogToUi("[Injector] UI log window ready. Close hides to tray; right-click tray icon -> Exit really quits.\r\n");
+      } else {
+        SetTimer(hwnd, 1, 500, NULL);
+      }
+      return 0;
+    }
+    case WM_SIZE:
+      if (g_logEdit) MoveWindow(g_logEdit, 0, 0, LOWORD(lParam), HIWORD(lParam), TRUE);
+      if (!IsGuiBuild()) {
+        HWND console = GetConsoleWindow();
+        if (console && IsIconic(console)) HideConsoleToTray();
+      }
       return 0;
     case WM_TIMER: {
       HWND console = GetConsoleWindow();
       if (console && IsIconic(console)) HideConsoleToTray();
+      return 0;
+    }
+    case WM_APPEND_LOG: {
+      std::string *text = reinterpret_cast<std::string *>(lParam);
+      if (text) {
+        AppendLogTextToEdit(*text);
+        delete text;
+      }
       return 0;
     }
     case WM_TRAYICON:
@@ -123,7 +299,11 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         POINT pt;
         GetCursorPos(&pt);
         HMENU menu = CreatePopupMenu();
-        AppendMenuA(menu, MF_STRING, ID_TRAY_RESTORE, "Open");
+        AppendMenuA(menu, MF_STRING, ID_TRAY_RESTORE, "Open Logs");
+        if (IsGuiBuild()) {
+          AppendMenuA(menu, MF_STRING, ID_LOG_COPY, "Copy Logs");
+          AppendMenuA(menu, MF_STRING, ID_LOG_CLEAR, "Clear Logs");
+        }
         AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
         AppendMenuA(menu, MF_STRING, ID_TRAY_EXIT, "Exit");
         SetForegroundWindow(hwnd);
@@ -136,13 +316,24 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         case ID_TRAY_RESTORE:
           RestoreConsoleFromTray();
           return 0;
+        case ID_LOG_COPY:
+          CopyAllLogText();
+          return 0;
+        case ID_LOG_CLEAR:
+          if (g_logEdit) SetWindowTextA(g_logEdit, "");
+          return 0;
         case ID_TRAY_EXIT:
           RequestExit();
           return 0;
       }
       break;
     case WM_CLOSE:
-      HideConsoleToTray();
+      if (!g_exitRequested.load()) {
+        HideConsoleToTray();
+        AppendLogToUi("[Injector] Close button hides to tray. Use tray menu Exit to quit and restore processes.\r\n");
+        return 0;
+      }
+      DestroyWindow(hwnd);
       return 0;
     case WM_DESTROY:
       RemoveTrayIcon();
@@ -154,15 +345,22 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 void TrayThread() {
   HINSTANCE hInst = GetModuleHandleA(NULL);
-  const char *cls = "GhostProxifierTrayWindow";
+  const char *cls = IsGuiBuild() ? "GhostProxifierLogWindow" : "GhostProxifierTrayWindow";
   WNDCLASSA wc = {};
   wc.lpfnWndProc = TrayWndProc;
   wc.hInstance = hInst;
+  wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+  wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+  wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
   wc.lpszClassName = cls;
   RegisterClassA(&wc);
 
-  g_trayWnd = CreateWindowExA(0, cls, "Ghost Proxifier", WS_OVERLAPPED,
-                              0, 0, 0, 0, NULL, NULL, hInst, NULL);
+  DWORD style = IsGuiBuild() ? WS_OVERLAPPEDWINDOW : WS_OVERLAPPED;
+  int w = IsGuiBuild() ? 900 : 0;
+  int h = IsGuiBuild() ? 560 : 0;
+  g_trayWnd = CreateWindowExA(0, cls, "Ghost Proxifier Logs", style,
+                              CW_USEDEFAULT, CW_USEDEFAULT, w, h,
+                              NULL, NULL, hInst, NULL);
   if (!g_trayWnd) return;
 
   g_trayIcon = {};
@@ -174,6 +372,8 @@ void TrayThread() {
   g_trayIcon.hIcon = LoadIcon(NULL, IDI_APPLICATION);
   strcpy_s(g_trayIcon.szTip, "Ghost Proxifier");
   Shell_NotifyIconA(NIM_ADD, &g_trayIcon);
+
+  if (IsGuiBuild()) ShowWindow(g_trayWnd, SW_SHOW);
 
   MSG m;
   while (GetMessageA(&m, NULL, 0, 0) > 0) {
@@ -360,6 +560,7 @@ struct ExitRestoreGuard {
     RestoreNow();
     UninstallConsoleCloseToTrayHook();
     RemoveTrayIcon();
+    UninstallUiLogCapture();
   }
 };
 
@@ -539,6 +740,7 @@ int AppMain(int argc, char *argv[]) {
   AttachConsoleForCliIfNeeded(argc);
   SetConsoleOutputCP(CP_UTF8);
   SetConsoleCP(CP_UTF8);
+  InstallUiLogCapture();
 
   std::vector<DWORD> injectedPids;
 

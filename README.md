@@ -402,3 +402,12 @@ Domains in direct rules use system DNS and direct sockets, so they can go throug
 - 示例配置默认 `dns_ipv6=on`，IPv6/AAAA 会通过代理 DNS 查询；如果当前网络 IPv6 不可用或回退很慢，可改为 `dns_ipv6=off`。
 - `ghost-proxifier.exe` 改为 Windows GUI 子系统：双击运行时不再弹出终端窗口，程序常驻系统托盘；只有托盘右键 `Exit` 才会退出并自动恢复已注入进程状态。
 - 从命令行带参数启动时仍会尽量附加到当前控制台，以便 `--help`、`--status`、`--unload` 等命令输出文本。
+
+## v0.4.9 package layout
+
+Release ZIP now includes two launchers so you can choose per run:
+
+- `ghost-proxifier.exe`: GUI/tray build. Double-click opens a log window; closing the window hides it to the system tray. Use tray menu **Exit** to really quit and restore injected processes.
+- `ghost-proxifier-console.exe`: console build. Double-click opens a terminal window and keeps the previous terminal-style logging behavior.
+
+The GUI build also appends a local `ghost-proxifier.log` file next to the executable for troubleshooting.
