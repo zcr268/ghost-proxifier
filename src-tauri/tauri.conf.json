@@ -26,6 +26,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "icon": [
+      "icons/icon.ico"
+    ],
     "resources": [
       "../bin/ghost-proxifier.exe",
       "../bin/ghost_core.dll"
