@@ -14,6 +14,7 @@
 #include <atomic>
 #include <io.h>
 #include <fcntl.h>
+#include <cstdio>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -523,7 +524,19 @@ std::string FullPath(const std::string &path) {
   return full;
 }
 
-int main(int argc, char *argv[]) {
+void AttachConsoleForCliIfNeeded(int argc) {
+  if (argc <= 1 || GetConsoleWindow()) return;
+  if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+    FILE *f = nullptr;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    freopen_s(&f, "CONOUT$", "w", stderr);
+    freopen_s(&f, "CONIN$", "r", stdin);
+    std::ios::sync_with_stdio(true);
+  }
+}
+
+int AppMain(int argc, char *argv[]) {
+  AttachConsoleForCliIfNeeded(argc);
   SetConsoleOutputCP(CP_UTF8);
   SetConsoleCP(CP_UTF8);
 
@@ -761,4 +774,34 @@ int main(int argc, char *argv[]) {
   restoreGuard.RestoreNow();
 
   return 0;
+}
+
+
+int main(int argc, char *argv[]) {
+  return AppMain(argc, argv);
+}
+
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+  int argc = 0;
+  LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  if (!wargv) return AppMain(0, nullptr);
+
+  std::vector<std::string> args;
+  std::vector<char *> argv;
+  args.reserve(argc);
+  argv.reserve(argc + 1);
+  for (int i = 0; i < argc; ++i) {
+    int len = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+    std::string arg;
+    if (len > 0) {
+      arg.resize(len);
+      WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, arg.data(), len, nullptr, nullptr);
+      arg.resize(len - 1);
+    }
+    args.push_back(std::move(arg));
+  }
+  LocalFree(wargv);
+  for (auto &arg : args) argv.push_back(arg.data());
+  argv.push_back(nullptr);
+  return AppMain(argc, argv.data());
 }

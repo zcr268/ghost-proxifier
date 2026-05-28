@@ -393,3 +393,12 @@ Domains in direct rules use system DNS and direct sockets, so they can go throug
 - Clicking the console close button is intercepted as minimize-to-tray when Windows allows it; if Windows refuses console subclassing, the close command is disabled so the process cannot be killed without restoring hooks. Use minimize or the tray icon instead.
 - Use the tray icon right-click menu `Exit` to quit; every normal exit path unloads `ghost_core.dll` from injected processes so they stop using the proxy.
 - `ghost-proxifier.exe --unload` can be used to restore already-injected processes manually.
+
+---
+
+## v0.4.8 运行说明
+
+- 发布包内的配置文件直接命名为 `ghost.conf`，解压后按需修改 `proxy=` 和 `process=` 即可运行。
+- 示例配置默认 `dns_ipv6=on`，IPv6/AAAA 会通过代理 DNS 查询；如果当前网络 IPv6 不可用或回退很慢，可改为 `dns_ipv6=off`。
+- `ghost-proxifier.exe` 改为 Windows GUI 子系统：双击运行时不再弹出终端窗口，程序常驻系统托盘；只有托盘右键 `Exit` 才会退出并自动恢复已注入进程状态。
+- 从命令行带参数启动时仍会尽量附加到当前控制台，以便 `--help`、`--status`、`--unload` 等命令输出文本。

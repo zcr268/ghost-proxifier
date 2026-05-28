@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 include_directories(minhook/include)
 add_subdirectory(minhook)
 add_library(ghost_core SHARED ghost_core.cpp)
-add_executable(ghost-proxifier ghost_injector.cpp)
+add_executable(ghost-proxifier WIN32 ghost_injector.cpp)
 target_link_libraries(ghost_core minhook ws2_32)
 target_link_libraries(ghost-proxifier ws2_32 psapi shell32 user32)
 

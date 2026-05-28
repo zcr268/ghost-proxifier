@@ -87,7 +87,7 @@ enum class ProxyType { Http, Socks5 };
 ProxyType g_ProxyType = ProxyType::Http;
 enum class DnsMode { Proxy, System };
 DnsMode g_DnsMode = DnsMode::Proxy;
-bool g_DnsIpv6 = false;
+bool g_DnsIpv6 = true;
 std::string g_DnsServerIP = "8.8.8.8";
 int g_DnsServerPort = 53;
 const DWORD DNS_SOCKET_TIMEOUT_MS = 2500;
@@ -901,14 +901,15 @@ static std::atomic<unsigned short> g_DnsTxId{1};
 
 // --- DNS Cache ---
 struct DnsCacheEntry {
-    std::vector<DWORD> ips;
+    std::vector<DWORD> ips4;
+    std::vector<in6_addr> ips6;
     DWORD expire_tick; // GetTickCount() based
 };
 std::unordered_map<std::string, DnsCacheEntry> g_DnsCache;
 std::mutex g_DnsCacheMutex;
 const DWORD DNS_CACHE_TTL_MS = 300 * 1000; // 5 minutes
 
-int BuildDnsQuery(const char* domain, char* buf, int bufSize) {
+int BuildDnsQuery(const char* domain, unsigned short qtype, char* buf, int bufSize) {
     if (!domain || bufSize < 512) return 0;
     unsigned short txid = g_DnsTxId.fetch_add(1);
     buf[0] = (txid >> 8) & 0xFF;
@@ -928,8 +929,10 @@ int BuildDnsQuery(const char* domain, char* buf, int bufSize) {
         pos += len;
         if (dot) p = dot + 1; else break;
     }
+    if (pos + 5 > bufSize) return 0;
     buf[pos++] = 0; // end of name
-    buf[pos++] = 0x00; buf[pos++] = 0x01; // type A
+    buf[pos++] = (char)((qtype >> 8) & 0xFF);
+    buf[pos++] = (char)(qtype & 0xFF);
     buf[pos++] = 0x00; buf[pos++] = 0x01; // class IN
     return pos;
 }
@@ -975,13 +978,12 @@ SOCKET AcquireDnsConn() {
         DnsPoolConn conn = g_DnsPool.back();
         g_DnsPool.pop_back();
         if (now - conn.last_used < DNS_POOL_IDLE_MS) {
-            // Quick liveness check: if select says readable, connection is dead (FIN/RST)
             fd_set rfds;
             FD_ZERO(&rfds);
             FD_SET(conn.sock, &rfds);
             timeval tv = {0, 0};
             if (select(0, &rfds, NULL, NULL, &tv) == 0) {
-                return conn.sock; // alive
+                return conn.sock;
             }
         }
         closesocket(conn.sock);
@@ -998,8 +1000,13 @@ void ReleaseDnsConn(SOCKET s) {
     g_DnsPool.push_back({s, GetTickCount()});
 }
 
+struct ProxyDnsResult {
+    std::vector<DWORD> ips4;
+    std::vector<in6_addr> ips6;
+};
+
 // --- DNS Query via Pooled Connection ---
-bool DnsQueryOnSocket(SOCKET s, const char* query, int qlen, std::vector<DWORD>& results) {
+bool DnsQueryOnSocket(SOCKET s, const char* query, int qlen, unsigned short qtype, ProxyDnsResult& results) {
     unsigned short len_n = htons((unsigned short)qlen);
     if (!SyncSend(s, (char*)&len_n, 2) || !SyncSend(s, query, qlen))
         return false;
@@ -1007,7 +1014,7 @@ bool DnsQueryOnSocket(SOCKET s, const char* query, int qlen, std::vector<DWORD>&
     if (real_recv(s, (char*)&rlen_n, 2, 0) != 2)
         return false;
     int rlen = ntohs(rlen_n);
-    if (rlen <= 0 || rlen > 2048)
+    if (rlen <= 0 || rlen > 4096)
         return false;
     std::vector<char> resp(rlen);
     int rvd = 0;
@@ -1016,7 +1023,6 @@ bool DnsQueryOnSocket(SOCKET s, const char* query, int qlen, std::vector<DWORD>&
         if (c <= 0) return false;
         rvd += c;
     }
-    // Parse A records
     int a_off = 12;
     unsigned short q_cnt = ntohs(*(unsigned short*)(resp.data() + 4));
     for (int i = 0; i < q_cnt && a_off < rlen; i++) {
@@ -1029,10 +1035,14 @@ bool DnsQueryOnSocket(SOCKET s, const char* query, int qlen, std::vector<DWORD>&
         if (a_off + 10 <= rlen) {
             unsigned short type = ntohs(*(unsigned short*)(resp.data() + a_off));
             unsigned short dlen = ntohs(*(unsigned short*)(resp.data() + a_off + 8));
-            if (type == 1 && dlen == 4 && a_off + 10 + 4 <= rlen) {
+            if (type == 1 && qtype == 1 && dlen == 4 && a_off + 10 + 4 <= rlen) {
                 DWORD ip;
                 memcpy(&ip, resp.data() + a_off + 10, 4);
-                results.push_back(ip);
+                results.ips4.push_back(ip);
+            } else if (type == 28 && qtype == 28 && dlen == 16 && a_off + 10 + 16 <= rlen) {
+                in6_addr ip6;
+                memcpy(&ip6, resp.data() + a_off + 10, 16);
+                results.ips6.push_back(ip6);
             }
             a_off += 10 + dlen;
         } else break;
@@ -1040,55 +1050,63 @@ bool DnsQueryOnSocket(SOCKET s, const char* query, int qlen, std::vector<DWORD>&
     return true;
 }
 
-std::vector<DWORD> ProxyDnsResolve(const char* domain) {
-    std::vector<DWORD> results;
+ProxyDnsResult ProxyDnsResolveTyped(const char* domain, unsigned short qtype) {
+    ProxyDnsResult results;
     if (!domain || g_DnsMode != DnsMode::Proxy) return results;
-    std::string key(domain);
-    // Check cache
+    if (qtype == 28 && !g_DnsIpv6) return results;
+    std::string key = std::string(domain) + "|" + std::to_string(qtype);
     {
         std::lock_guard<std::mutex> lock(g_DnsCacheMutex);
         auto it = g_DnsCache.find(key);
         if (it != g_DnsCache.end() && GetTickCount() < it->second.expire_tick) {
-            NetLog("[DNS-Cache] HIT: %s (%d IPs)", domain, (int)it->second.ips.size());
-            return it->second.ips;
+            NetLog("[DNS-Cache] HIT: %s type %u (A:%d AAAA:%d)", domain, qtype,
+                   (int)it->second.ips4.size(), (int)it->second.ips6.size());
+            results.ips4 = it->second.ips4;
+            results.ips6 = it->second.ips6;
+            return results;
         }
     }
     char query[512];
-    int qlen = BuildDnsQuery(domain, query, sizeof(query));
+    int qlen = BuildDnsQuery(domain, qtype, query, sizeof(query));
     if (qlen == 0) return results;
 
-    // Try pooled connection first
     SOCKET s = AcquireDnsConn();
     if (s != INVALID_SOCKET) {
-        if (DnsQueryOnSocket(s, query, qlen, results)) {
-            ReleaseDnsConn(s); // return to pool
+        if (DnsQueryOnSocket(s, query, qlen, qtype, results)) {
+            ReleaseDnsConn(s);
         } else {
-            closesocket(s); // dead, try fresh
+            closesocket(s);
             s = CreateDnsConn();
             if (s != INVALID_SOCKET) {
-                if (DnsQueryOnSocket(s, query, qlen, results))
+                if (DnsQueryOnSocket(s, query, qlen, qtype, results))
                     ReleaseDnsConn(s);
                 else
                     closesocket(s);
             }
         }
     } else {
-        // Pool empty, create new
         s = CreateDnsConn();
         if (s != INVALID_SOCKET) {
-            if (DnsQueryOnSocket(s, query, qlen, results))
+            if (DnsQueryOnSocket(s, query, qlen, qtype, results))
                 ReleaseDnsConn(s);
             else
                 closesocket(s);
         }
     }
 
-    // Store in cache if we got results
-    if (!results.empty()) {
+    if (!results.ips4.empty() || !results.ips6.empty()) {
         std::lock_guard<std::mutex> lock(g_DnsCacheMutex);
-        g_DnsCache[key] = {results, GetTickCount() + DNS_CACHE_TTL_MS};
+        g_DnsCache[key] = {results.ips4, results.ips6, GetTickCount() + DNS_CACHE_TTL_MS};
     }
     return results;
+}
+
+std::vector<DWORD> ProxyDnsResolve(const char* domain) {
+    return ProxyDnsResolveTyped(domain, 1).ips4;
+}
+
+std::vector<in6_addr> ProxyDnsResolve6(const char* domain) {
+    return ProxyDnsResolveTyped(domain, 28).ips6;
 }
 
 // --- Hook Implementations ---
@@ -1467,6 +1485,23 @@ INT WSAAPI hook_getaddrinfo(PCSTR pNodeName, PCSTR pServiceName, const ADDRINFOA
         }
         return ret;
     }
+    int requestedFamily = pHints ? pHints->ai_family : AF_UNSPEC;
+    if (requestedFamily == AF_INET6) {
+        std::vector<in6_addr> ips6 = ProxyDnsResolve6(domain.c_str());
+        if (!ips6.empty()) {
+            char ip6_str[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, &ips6[0], ip6_str, INET6_ADDRSTRLEN);
+            std::string all_ips;
+            for (const auto &ip6 : ips6) {
+                char s[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, &ip6, s, INET6_ADDRSTRLEN);
+                if (!all_ips.empty()) all_ips += ", ";
+                all_ips += s;
+            }
+            NetLog("[DNS-Proxy] getaddrinfo AAAA: %s -> [%s] (%d IPs)", domain.c_str(), all_ips.c_str(), (int)ips6.size());
+            return real_getaddrinfo(ip6_str, pServiceName, effectiveHints, ppResult);
+        }
+    }
     std::vector<DWORD> ips = ProxyDnsResolve(domain.c_str());
     if (!ips.empty()) {
         // Use first resolved IP to call real function (no actual DNS happens)
@@ -1544,6 +1579,25 @@ INT WSAAPI hook_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRIN
             }
         }
         return ret;
+    }
+    int requestedFamily = pHints ? pHints->ai_family : AF_UNSPEC;
+    if (requestedFamily == AF_INET6) {
+        std::vector<in6_addr> ips6 = ProxyDnsResolve6(domain.c_str());
+        if (!ips6.empty()) {
+            char ip6_str[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, &ips6[0], ip6_str, INET6_ADDRSTRLEN);
+            std::string all_ips;
+            for (const auto &ip6 : ips6) {
+                char s[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, &ip6, s, INET6_ADDRSTRLEN);
+                if (!all_ips.empty()) all_ips += ", ";
+                all_ips += s;
+            }
+            NetLog("[DNS-Proxy] GetAddrInfoW AAAA: %s -> [%s] (%d IPs)", domain.c_str(), all_ips.c_str(), (int)ips6.size());
+            wchar_t wip6[INET6_ADDRSTRLEN];
+            MultiByteToWideChar(CP_UTF8, 0, ip6_str, -1, wip6, INET6_ADDRSTRLEN);
+            return real_GetAddrInfoW(wip6, pServiceName, effectiveHints, ppResult);
+        }
     }
     std::vector<DWORD> ips = ProxyDnsResolve(domain.c_str());
     if (!ips.empty()) {

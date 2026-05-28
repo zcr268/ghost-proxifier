@@ -35,7 +35,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
           Copy-Item "build\${{ env.BUILD_TYPE }}\ghost-proxifier.exe" $dist
           Copy-Item "build\${{ env.BUILD_TYPE }}\ghost_core.dll" $dist
-          Copy-Item "ghost.conf.example" $dist
+          Copy-Item "ghost.conf.example" "$dist\ghost.conf"
           Copy-Item "README.md" $dist
           Compress-Archive -Path "$dist\*" -DestinationPath "ghost-proxifier-windows-x64.zip" -Force
 

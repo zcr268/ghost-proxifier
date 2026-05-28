@@ -16,10 +16,9 @@ process=Codex.exe
 # dns=system disables Ghost's DNS proxy and uses the process/system DNS directly.
 dns=proxy
 dns_server=8.8.8.8:53
-# IPv6/AAAA is disabled by default to avoid slow IPv6 fallback when IPv6 is unavailable.
-# When off, AF_UNSPEC getaddrinfo calls are also forced to IPv4.
-# Set dns_ipv6=on if you need AAAA answers.
-dns_ipv6=off
+# IPv6/AAAA is enabled by default.
+# Set dns_ipv6=off if your network has no working IPv6 and AAAA fallback is slow.
+dns_ipv6=on
 
 # Direct connection rules: use normal LAN/VPN route instead of HTTP CONNECT/SOCKS5 proxy.
 # Local loopback is direct by default so the app can still talk to local services.
