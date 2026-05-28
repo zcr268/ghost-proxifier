@@ -56,7 +56,7 @@ jobs:
 
       - name: Build Tauri UI
         run: |
-          npm install
+          npm ci
           npm run tauri -- build
 
       - name: Package Tauri UI bundles
