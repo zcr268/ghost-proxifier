@@ -843,6 +843,11 @@ bool PrepareIpv6RelayForSocket(SOCKET s, const PendingProxy &target, sockaddr_st
   return true;
 }
 
+bool IsPendingConnectError(int err) {
+  return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS ||
+         err == WSAEALREADY || err == WSA_IO_PENDING;
+}
+
 void RemoveIpv6RelayTargetForSocket(SOCKET s) {
   sockaddr_storage local = {};
   int localLen = sizeof(local);
@@ -1483,7 +1488,7 @@ BOOL PASCAL hook_ConnectEx(SOCKET s, const struct sockaddr *name, int namelen,
         g_PendingProxySockets[s] = std::move(pp);
       }
       BOOL ret = real_ConnectEx(s, (const sockaddr *)&p, pLen, NULL, 0, lpBytesSent, lpOverlapped);
-      if (!ret && usingRelay) RemoveIpv6RelayTargetForSocket(s);
+      if (!ret && usingRelay && !IsPendingConnectError(WSAGetLastError())) RemoveIpv6RelayTargetForSocket(s);
       return ret;
     } else {
       LogDirectConnectIfUseful("ConnectEx", ip, port, domain, name->sa_family, is_local);
@@ -1544,7 +1549,7 @@ int WINAPI hook_WSAConnect(SOCKET s, const sockaddr *name, int namelen,
         g_PendingProxySockets[s] = pp;
       }
       int ret = real_WSAConnect(s, (const sockaddr *)&p, pLen, NULL, NULL, lpSQOS, lpGQOS);
-      if (ret == SOCKET_ERROR && usingRelay) RemoveIpv6RelayTargetForSocket(s);
+      if (ret == SOCKET_ERROR && usingRelay && !IsPendingConnectError(WSAGetLastError())) RemoveIpv6RelayTargetForSocket(s);
       return ret;
     } else {
       LogDirectConnectIfUseful("WSAConnect", ip, port, domain, name->sa_family, is_local);
@@ -1612,7 +1617,7 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
         g_PendingProxySockets[s] = pp;
       }
       int ret = real_connect(s, (const sockaddr *)&p, pLen);
-      if (ret == SOCKET_ERROR && usingRelay) RemoveIpv6RelayTargetForSocket(s);
+      if (ret == SOCKET_ERROR && usingRelay && !IsPendingConnectError(WSAGetLastError())) RemoveIpv6RelayTargetForSocket(s);
       return ret;
     } else {
       LogDirectConnectIfUseful("connect", ip, port, domain, name->sa_family, is_local);
