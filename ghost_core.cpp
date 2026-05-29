@@ -229,7 +229,11 @@ bool ShouldFastFailIpv6Connect(int family, bool is_local) {
 
 bool ShouldBlockDohConnect(int family, const char* ip, int port) {
     if (!IsKnownDoHServer(ip, port)) return false;
-    if (g_DnsMode == DnsMode::Proxy) return true;
+    // Do not block TCP/443 to public DNS endpoints when DNS proxying is enabled:
+    // browsers and runtimes may legitimately connect to IPv6 DoH endpoints, and
+    // the proxifier should relay that traffic through the configured proxy just
+    // like any other HTTPS connection.  Only block these when IPv6 connections
+    // are explicitly configured to fail fast so callers can fall back.
     return family == AF_INET6 && g_Ipv6ConnectMode == Ipv6ConnectMode::Fail;
 }
 
@@ -1468,10 +1472,7 @@ BOOL PASCAL hook_ConnectEx(SOCKET s, const struct sockaddr *name, int namelen,
       int pLen = 0;
       bool usingRelay = false;
       if (name->sa_family == AF_INET6 && ProxyAddressIsIPv4()) {
-        int v6only = 0;
-        int optlen = sizeof(v6only);
-        getsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&v6only, &optlen);
-        if (v6only != 0) usingRelay = PrepareIpv6RelayForSocket(s, pp, p, pLen);
+        usingRelay = PrepareIpv6RelayForSocket(s, pp, p, pLen);
       }
       if (!usingRelay) {
         if (!BuildProxySockaddrForSocket(s, name->sa_family, p, pLen)) {
@@ -1532,10 +1533,7 @@ int WINAPI hook_WSAConnect(SOCKET s, const sockaddr *name, int namelen,
       int pLen = 0;
       bool usingRelay = false;
       if (name->sa_family == AF_INET6 && ProxyAddressIsIPv4()) {
-        int v6only = 0;
-        int optlen = sizeof(v6only);
-        getsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&v6only, &optlen);
-        if (v6only != 0) usingRelay = PrepareIpv6RelayForSocket(s, pp, p, pLen);
+        usingRelay = PrepareIpv6RelayForSocket(s, pp, p, pLen);
       }
       if (!usingRelay) {
         if (!BuildProxySockaddrForSocket(s, name->sa_family, p, pLen)) {
@@ -1603,10 +1601,7 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
       int pLen = 0;
       bool usingRelay = false;
       if (name->sa_family == AF_INET6 && ProxyAddressIsIPv4()) {
-        int v6only = 0;
-        int optlen = sizeof(v6only);
-        getsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&v6only, &optlen);
-        if (v6only != 0) usingRelay = PrepareIpv6RelayForSocket(s, pp, p, pLen);
+        usingRelay = PrepareIpv6RelayForSocket(s, pp, p, pLen);
       }
       if (!usingRelay) {
         if (!BuildProxySockaddrForSocket(s, name->sa_family, p, pLen)) {
