@@ -21,8 +21,10 @@ log_max_mb=10
 dns=system
 dns_server=8.8.8.8:53
 # IPv6/AAAA is enabled by default.
-# Set dns_ipv6=off if your network has no working IPv6 and AAAA/IPv6 connect fallback is slow.
-dns_ipv6=off
+# Set dns_ipv6=off if your network has no working IPv6 and AAAA fallback is slow.
+dns_ipv6=on
+# IPv6 TCP connect handling: direct=let system handle it, fail=fast fail, proxy=try upstream proxy.
+ipv6_connect=direct
 
 # Direct connection rules: use normal LAN/VPN route instead of HTTP CONNECT/SOCKS5 proxy.
 # Local loopback is direct by default so the app can still talk to local services.

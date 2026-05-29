@@ -87,6 +87,8 @@ enum class ProxyType { Http, Socks5 };
 ProxyType g_ProxyType = ProxyType::Http;
 enum class DnsMode { Proxy, System };
 DnsMode g_DnsMode = DnsMode::Proxy;
+enum class Ipv6ConnectMode { Direct, Fail, Proxy };
+Ipv6ConnectMode g_Ipv6ConnectMode = Ipv6ConnectMode::Direct;
 bool g_DnsIpv6 = true;
 std::string g_DnsServerIP = "8.8.8.8";
 int g_DnsServerPort = 53;
@@ -207,13 +209,13 @@ bool IsKnownDoHServer(const char* ip, int port) {
 }
 
 bool ShouldFastFailIpv6Connect(int family, bool is_local) {
-    return family == AF_INET6 && !is_local && !g_DnsIpv6;
+    return family == AF_INET6 && !is_local && g_Ipv6ConnectMode == Ipv6ConnectMode::Fail;
 }
 
 bool ShouldBlockDohConnect(int family, const char* ip, int port) {
     if (!IsKnownDoHServer(ip, port)) return false;
     if (g_DnsMode == DnsMode::Proxy) return true;
-    return family == AF_INET6 && !g_DnsIpv6;
+    return family == AF_INET6 && g_Ipv6ConnectMode == Ipv6ConnectMode::Fail;
 }
 
 // --- Helpers ---
@@ -468,6 +470,15 @@ void ApplyConfigKey(const std::string &key, const std::string &value) {
     }
   } else if (k == "dns_ipv6" || k == "ipv6_dns" || k == "dns_aaaa") {
     g_DnsIpv6 = ParseBool(v, g_DnsIpv6);
+  } else if (k == "ipv6_connect" || k == "connect_ipv6" || k == "ipv6") {
+    std::string lower = ToLower(v);
+    if (lower == "direct" || lower == "system" || lower == "bypass") {
+      g_Ipv6ConnectMode = Ipv6ConnectMode::Direct;
+    } else if (lower == "fail" || lower == "off" || lower == "disable" || lower == "disabled" || lower == "fast_fail" || lower == "fast-fail") {
+      g_Ipv6ConnectMode = Ipv6ConnectMode::Fail;
+    } else if (lower == "proxy" || lower == "proxied" || lower == "on" || lower == "enable" || lower == "enabled") {
+      g_Ipv6ConnectMode = Ipv6ConnectMode::Proxy;
+    }
   }
 }
 
@@ -539,6 +550,7 @@ bool IsDirectIp(DWORD net_ip) {
 
 bool ShouldDirectConnect(const char *ip, int port, const std::string &domain, int family, bool is_local) {
   if (is_local || port == g_ProxyPort || port == 9999) return true;
+  if (family == AF_INET6 && g_Ipv6ConnectMode == Ipv6ConnectMode::Direct) return true;
   if (!domain.empty() && IsDirectDomain(domain)) return true;
   if (family == AF_INET) {
     in_addr addr;
@@ -1149,7 +1161,7 @@ BOOL PASCAL hook_ConnectEx(SOCKET s, const struct sockaddr *name, int namelen,
       return FALSE;
     }
     if (ShouldFastFailIpv6Connect(name->sa_family, is_local)) {
-      NetLog("[hook] Fast-fail IPv6 connect: %s:%d (dns_ipv6=off)", ip, port);
+      NetLog("[hook] Fast-fail IPv6 connect: %s:%d (ipv6_connect=fail)", ip, port);
       WSASetLastError(WSAEHOSTUNREACH);
       return FALSE;
     }
@@ -1204,7 +1216,7 @@ int WINAPI hook_WSAConnect(SOCKET s, const sockaddr *name, int namelen,
       return SOCKET_ERROR;
     }
     if (ShouldFastFailIpv6Connect(name->sa_family, is_local)) {
-      NetLog("[hook] Fast-fail IPv6 connect: %s:%d (dns_ipv6=off)", ip, port);
+      NetLog("[hook] Fast-fail IPv6 connect: %s:%d (ipv6_connect=fail)", ip, port);
       WSASetLastError(WSAEHOSTUNREACH);
       return SOCKET_ERROR;
     }
@@ -1262,7 +1274,7 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
       return SOCKET_ERROR;
     }
     if (ShouldFastFailIpv6Connect(name->sa_family, is_local)) {
-      NetLog("[hook] Fast-fail IPv6 connect: %s:%d (dns_ipv6=off)", ip, port);
+      NetLog("[hook] Fast-fail IPv6 connect: %s:%d (ipv6_connect=fail)", ip, port);
       WSASetLastError(WSAEHOSTUNREACH);
       return SOCKET_ERROR;
     }
@@ -1785,10 +1797,12 @@ DWORD WINAPI SetupThread(LPVOID lpParam) {
   if (g_DnsMode == DnsMode::Proxy)
     CreateThread(NULL, 0, DnsProxyThread, NULL, 0, NULL);
   MH_EnableHook(MH_ALL_HOOKS);
-  NetLog("[Init] Hooks installed successfully (PID: %d, proxy: %s://%s:%d, dns: %s, dns_server: %s:%d, dns_ipv6: %s, direct domains: %d, direct IP rules: %d)",
+  const char *ipv6ConnectMode = g_Ipv6ConnectMode == Ipv6ConnectMode::Direct ? "direct" :
+                                (g_Ipv6ConnectMode == Ipv6ConnectMode::Fail ? "fail" : "proxy");
+  NetLog("[Init] Hooks installed successfully (PID: %d, proxy: %s://%s:%d, dns: %s, dns_server: %s:%d, dns_ipv6: %s, ipv6_connect: %s, direct domains: %d, direct IP rules: %d)",
          GetCurrentProcessId(), g_ProxyType == ProxyType::Socks5 ? "socks5" : "http",
          g_ProxyIP.c_str(), g_ProxyPort, g_DnsMode == DnsMode::Proxy ? "proxy" : "system",
-         g_DnsServerIP.c_str(), g_DnsServerPort, g_DnsIpv6 ? "on" : "off",
+         g_DnsServerIP.c_str(), g_DnsServerPort, g_DnsIpv6 ? "on" : "off", ipv6ConnectMode,
          (int)g_DirectDomains.size(), (int)g_DirectIpRules.size());
   } __except(EXCEPTION_EXECUTE_HANDLER) {
     // Silently absorb any crash during initialization
