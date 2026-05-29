@@ -1187,6 +1187,17 @@ bool DescribeSockaddr(const sockaddr *sa, int salen, std::string &ip, int &port)
   return false;
 }
 
+bool IsUdp53Target(const sockaddr *sa, int salen) {
+  if (!sa) return false;
+  if (sa->sa_family == AF_INET && salen >= (int)sizeof(sockaddr_in)) {
+    return ntohs(((const sockaddr_in *)sa)->sin_port) == 53;
+  }
+  if (sa->sa_family == AF_INET6 && salen >= (int)sizeof(sockaddr_in6)) {
+    return ntohs(((const sockaddr_in6 *)sa)->sin6_port) == 53;
+  }
+  return false;
+}
+
 bool EncodeSocks5UdpPacket(const sockaddr *target, int targetLen, const char *payload, int payloadLen, std::vector<char> &out) {
   if (!target || payloadLen < 0) return false;
   out.clear();
@@ -1355,27 +1366,37 @@ bool EnsureUdpProxyState(SOCKET appSocket, const sockaddr *target, int targetLen
 int UdpProxySend(SOCKET appSocket, const char *buf, int len, int flags, const sockaddr *target, int targetLen) {
   if (g_UdpMode == UdpMode::Direct) return SOCKET_ERROR;
   if (g_UdpMode == UdpMode::Fail) {
+    NetLog("[Proxy] UDP send blocked by udp=fail (len=%d)", len);
     WSASetLastError(WSAEHOSTUNREACH);
     return SOCKET_ERROR;
   }
   UdpProxyState st;
   if (!EnsureUdpProxyState(appSocket, target, targetLen, st)) {
+    NetLog("[Proxy] UDP send failed: no SOCKS5 UDP state (len=%d, err=%d)", len, WSAGetLastError());
     WSASetLastError(WSAECONNREFUSED);
     return SOCKET_ERROR;
   }
   std::vector<char> packet;
   if (!EncodeSocks5UdpPacket((sockaddr *)&st.target_addr, st.target_len, buf, len, packet)) {
+    NetLog("[Proxy] UDP send failed: cannot encode SOCKS5 UDP packet (len=%d)", len);
     WSASetLastError(WSAEINVAL);
     return SOCKET_ERROR;
   }
   int n = real_sendto(st.udp, packet.data(), (int)packet.size(), flags, (sockaddr *)&st.relay_addr, st.relay_len);
   if (n == SOCKET_ERROR) return SOCKET_ERROR;
+  std::string targetIp; int targetPort = 0;
+  std::string relayIp; int relayPort = 0;
+  DescribeSockaddr((sockaddr *)&st.target_addr, st.target_len, targetIp, targetPort);
+  DescribeSockaddr((sockaddr *)&st.relay_addr, st.relay_len, relayIp, relayPort);
+  NetLog("[Proxy] UDP send OK: %s:%d via %s:%d payload=%d packet=%d",
+         targetIp.c_str(), targetPort, relayIp.c_str(), relayPort, len, n);
   return len;
 }
 
 int UdpProxyRecv(SOCKET appSocket, char *buf, int len, int flags, sockaddr *from, int *fromLen) {
   UdpProxyState st;
   if (!EnsureUdpProxyState(appSocket, NULL, 0, st)) {
+    NetLog("[Proxy] UDP recv failed: no SOCKS5 UDP state (cap=%d, err=%d)", len, WSAGetLastError());
     WSASetLastError(WSAECONNREFUSED);
     return SOCKET_ERROR;
   }
@@ -1383,11 +1404,15 @@ int UdpProxyRecv(SOCKET appSocket, char *buf, int len, int flags, sockaddr *from
   sockaddr_storage peer = {};
   int peerLen = sizeof(peer);
   int n = real_recvfrom(st.udp, packet.data(), (int)packet.size(), flags, (sockaddr *)&peer, &peerLen);
-  if (n <= 0) return n;
+  if (n <= 0) {
+    NetLog("[Proxy] UDP recv failed/timeout: target socket cap=%d (ret=%d err=%d)", len, n, WSAGetLastError());
+    return n;
+  }
   int payloadLen = 0;
   sockaddr_storage decodedFrom = {};
   int decodedFromLen = sizeof(decodedFrom);
   if (!DecodeSocks5UdpPacket(packet.data(), n, buf, len, payloadLen, &decodedFrom, &decodedFromLen)) {
+    NetLog("[Proxy] UDP recv failed: invalid SOCKS5 UDP packet (packet=%d cap=%d)", n, len);
     WSASetLastError(WSAEMSGSIZE);
     return SOCKET_ERROR;
   }
@@ -1395,6 +1420,9 @@ int UdpProxyRecv(SOCKET appSocket, char *buf, int len, int flags, sockaddr *from
     memcpy(from, &decodedFrom, decodedFromLen);
     *fromLen = decodedFromLen;
   }
+  std::string srcIp; int srcPort = 0;
+  DescribeSockaddr((sockaddr *)&decodedFrom, decodedFromLen, srcIp, srcPort);
+  NetLog("[Proxy] UDP recv OK: %s:%d payload=%d packet=%d", srcIp.c_str(), srcPort, payloadLen, n);
   return payloadLen;
 }
 
@@ -1806,6 +1834,11 @@ BOOL PASCAL hook_ConnectEx(SOCKET s, const struct sockaddr *name, int namelen,
       WSASetLastError(WSAECONNREFUSED);
       return FALSE;
     }
+    if (IsDatagramSocket(s) && port == 53 && g_DnsMode == DnsMode::System) {
+      NetLog("[DNS] ConnectEx UDP/53 direct: %s:%d | %s (dns=system)", ip, port, domain.c_str());
+      return real_ConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength,
+                            lpBytesSent, lpOverlapped);
+    }
     if (!IsStreamSocket(s)) {
       if (IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
         UdpProxyState st;
@@ -1886,6 +1919,11 @@ int WINAPI hook_WSAConnect(SOCKET s, const sockaddr *name, int namelen,
       NetLog("[hook] Blocking DoH server %s:%d to force DNS fallback", ip, port);
       WSASetLastError(WSAECONNREFUSED);
       return SOCKET_ERROR;
+    }
+    if (IsDatagramSocket(s) && port == 53 && g_DnsMode == DnsMode::System) {
+      NetLog("[DNS] WSAConnect UDP/53 direct: %s:%d | %s (dns=system)", ip, port, domain.c_str());
+      return real_WSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS,
+                             lpGQOS);
     }
     if (!IsStreamSocket(s)) {
       if (IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
@@ -1971,6 +2009,10 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
       NetLog("[hook] Blocking DoH server %s:%d to force DNS fallback", ip, port);
       WSASetLastError(WSAECONNREFUSED);
       return SOCKET_ERROR;
+    }
+    if (IsDatagramSocket(s) && port == 53 && g_DnsMode == DnsMode::System) {
+      NetLog("[DNS] connect UDP/53 direct: %s:%d | %s (dns=system)", ip, port, domain.c_str());
+      return real_connect(s, name, namelen);
     }
     if (!IsStreamSocket(s)) {
       if (IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
@@ -2120,6 +2162,12 @@ int WINAPI hook_sendto(SOCKET s, const char *buf, int len, int flags,
     MarkDnsRedirectUdpSocket(s);
     return real_sendto(s, buf, len, flags, (sockaddr *)&l, sizeof(l));
   }
+  if (to && IsDatagramSocket(s) && g_DnsMode == DnsMode::System && IsUdp53Target(to, tolen)) {
+    std::string ip; int port = 0;
+    DescribeSockaddr(to, tolen, ip, port);
+    NetLog("[DNS] sendto UDP/53 direct: %s:%d (dns=system, len=%d)", ip.c_str(), port, len);
+    return real_sendto(s, buf, len, flags, to, tolen);
+  }
   if (to && IsDatagramSocket(s) && g_UdpMode != UdpMode::Direct) {
     return UdpProxySend(s, buf, len, flags, to, tolen);
   }
@@ -2140,6 +2188,14 @@ int WINAPI hook_WSASendTo(
     MarkDnsRedirectUdpSocket(s);
     return real_WSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent,
                           dwFlags, (sockaddr *)&l, sizeof(l), lpOverlapped,
+                          lpCompletionRoutine);
+  }
+  if (lpTo && IsDatagramSocket(s) && g_DnsMode == DnsMode::System && IsUdp53Target(lpTo, iTolen)) {
+    std::string ip; int port = 0;
+    DescribeSockaddr(lpTo, iTolen, ip, port);
+    NetLog("[DNS] WSASendTo UDP/53 direct: %s:%d (dns=system)", ip.c_str(), port);
+    return real_WSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent,
+                          dwFlags, lpTo, iTolen, lpOverlapped,
                           lpCompletionRoutine);
   }
   if (lpTo && IsDatagramSocket(s) && g_UdpMode != UdpMode::Direct) {
