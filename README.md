@@ -318,6 +318,7 @@ proxy=socks5://127.0.0.1:7890
 # proxy_type=socks5
 # proxy=127.0.0.1:1080
 process=Codex.exe
+udp=proxy
 
 # Direct connection rules. Subdomains are matched automatically.
 # Local loopback is direct by default so the app can still talk to local services.
@@ -368,6 +369,7 @@ Rules:
 - `direct_ip=` / `bypass_ip=` supports IPv4 or CIDR, for example `192.168.1.25` or `192.168.0.0/16`.
 - `direct=` / `bypass=` accepts a comma-separated mixed list, for example `direct=*.local,10.0.0.0/8,192.168.1.2`.
 - `ipv6_connect=proxy` forwards IPv6 TCP connects through the upstream proxy. When the upstream proxy is IPv4-only (for example `socks5://127.0.0.1:7890`) and the target socket is IPv6-only, Ghost uses a local `[::1]` relay so IPv6 targets can still be proxied. `direct` lets the system handle IPv6 directly and logs direct IPv6 connects; `fail` fast-fails non-local IPv6 connects.
+- `udp=proxy` forwards UDP through SOCKS5 `UDP ASSOCIATE` for all UDP ports, without special-casing `443`. It requires `proxy=socks5://...` and an upstream SOCKS5 server with UDP enabled. `udp=direct` lets UDP use the system route; `udp=fail` fast-fails UDP sends/connects.
 - `start_minimized_to_tray=on` starts the GUI build silently in the system tray without opening the log window. Double-click the tray icon or right-click -> `Open Logs` to restore it.
 - The old single-line format is still accepted as HTTP CONNECT: `127.0.0.1:2080`.
 

@@ -89,6 +89,8 @@ enum class DnsMode { Proxy, System };
 DnsMode g_DnsMode = DnsMode::Proxy;
 enum class Ipv6ConnectMode { Direct, Fail, Proxy };
 Ipv6ConnectMode g_Ipv6ConnectMode = Ipv6ConnectMode::Proxy;
+enum class UdpMode { Direct, Fail, Proxy };
+UdpMode g_UdpMode = UdpMode::Proxy;
 bool g_DnsIpv6 = true;
 std::string g_DnsServerIP = "8.8.8.8";
 int g_DnsServerPort = 53;
@@ -155,6 +157,19 @@ std::mutex g_Ipv6RelayMutex;
 SOCKET g_Ipv6RelayListen = INVALID_SOCKET;
 int g_Ipv6RelayPort = 0;
 std::atomic<bool> g_Ipv6RelayStarting{false};
+
+struct UdpProxyState {
+    SOCKET control = INVALID_SOCKET;     // SOCKS5 TCP control channel for UDP ASSOCIATE
+    SOCKET udp = INVALID_SOCKET;         // local UDP socket used to talk to SOCKS5 UDP relay
+    sockaddr_storage relay_addr = {};
+    int relay_len = 0;
+    sockaddr_storage target_addr = {};
+    int target_len = 0;
+};
+std::unordered_map<SOCKET, UdpProxyState> g_UdpProxyStates;
+std::mutex g_UdpProxyMutex;
+std::unordered_map<SOCKET, bool> g_DnsRedirectUdpSockets;
+std::mutex g_DnsRedirectUdpMutex;
 
 // Complete deferred proxy handshake before the first socket I/O.
 bool CompletePendingHandshake(SOCKET s) {
@@ -240,24 +255,34 @@ bool IsStreamSocket(SOCKET s) {
   return GetSocketType(s) == SOCK_STREAM;
 }
 
+bool IsDatagramSocket(SOCKET s) {
+  return GetSocketType(s) == SOCK_DGRAM;
+}
+
+void MarkDnsRedirectUdpSocket(SOCKET s) {
+  std::lock_guard<std::mutex> lock(g_DnsRedirectUdpMutex);
+  g_DnsRedirectUdpSockets[s] = true;
+}
+
+bool IsDnsRedirectUdpSocket(SOCKET s) {
+  std::lock_guard<std::mutex> lock(g_DnsRedirectUdpMutex);
+  return g_DnsRedirectUdpSockets.find(s) != g_DnsRedirectUdpSockets.end();
+}
+
 bool ShouldRejectUnsupportedUdpConnect(SOCKET s, const char *api, int family, const char *ip, int port, const std::string &domain) {
   int type = GetSocketType(s);
   if (type == 0 || type == SOCK_STREAM) return false;
 
-  // This proxifier currently tunnels TCP CONNECT through HTTP/SOCKS5.  A UDP
-  // connect() call is only a default peer assignment; redirecting that socket
-  // to the TCP loopback relay creates a fake "redirect" log line but no relay
-  // accept can ever happen.  UDP/443 is usually QUIC/DoH and should fail fast
-  // so the caller falls back to TCP, which can be proxied correctly.
-  if (type == SOCK_DGRAM && port == 443) {
-    NetLog("[hook] %s UDP/443 unsupported by TCP proxy; fast-fail: %s:%d | %s",
+  if (type == SOCK_DGRAM && g_UdpMode == UdpMode::Fail) {
+    NetLog("[hook] %s UDP disabled by config; fast-fail: %s:%d | %s",
            api, ip, port, domain.c_str());
     WSASetLastError(family == AF_INET6 ? WSAEHOSTUNREACH : WSAECONNREFUSED);
     return true;
   }
 
-  NetLog("[hook] %s non-TCP socket bypass proxy: %s:%d | %s (type=%d)",
-         api, ip, port, domain.c_str(), type);
+  NetLog("[hook] %s non-TCP socket uses system path: %s:%d | %s (type=%d, udp=%s)",
+         api, ip, port, domain.c_str(), type,
+         g_UdpMode == UdpMode::Proxy ? "proxy" : (g_UdpMode == UdpMode::Fail ? "fail" : "direct"));
   return false;
 }
 
@@ -531,6 +556,15 @@ void ApplyConfigKey(const std::string &key, const std::string &value) {
       g_Ipv6ConnectMode = Ipv6ConnectMode::Fail;
     } else if (lower == "proxy" || lower == "proxied" || lower == "on" || lower == "enable" || lower == "enabled") {
       g_Ipv6ConnectMode = Ipv6ConnectMode::Proxy;
+    }
+  } else if (k == "udp" || k == "udp_proxy" || k == "udp_mode") {
+    std::string lower = ToLower(v);
+    if (lower == "direct" || lower == "system" || lower == "bypass") {
+      g_UdpMode = UdpMode::Direct;
+    } else if (lower == "fail" || lower == "off" || lower == "disable" || lower == "disabled" || lower == "fast_fail" || lower == "fast-fail") {
+      g_UdpMode = UdpMode::Fail;
+    } else if (lower == "proxy" || lower == "proxied" || lower == "on" || lower == "enable" || lower == "enabled") {
+      g_UdpMode = UdpMode::Proxy;
     }
   }
 }
@@ -1133,6 +1167,237 @@ bool PerformProxyConnect(SOCKET s, const char *ip_str, int port, int family, con
   return PerformHttpConnect(s, ip_str, port, family, domain);
 }
 
+bool DescribeSockaddr(const sockaddr *sa, int salen, std::string &ip, int &port) {
+  char buf[INET6_ADDRSTRLEN] = {0};
+  if (!sa) return false;
+  if (sa->sa_family == AF_INET && salen >= (int)sizeof(sockaddr_in)) {
+    const sockaddr_in *a = (const sockaddr_in *)sa;
+    inet_ntop(AF_INET, &a->sin_addr, buf, sizeof(buf));
+    ip = buf;
+    port = ntohs(a->sin_port);
+    return true;
+  }
+  if (sa->sa_family == AF_INET6 && salen >= (int)sizeof(sockaddr_in6)) {
+    const sockaddr_in6 *a = (const sockaddr_in6 *)sa;
+    inet_ntop(AF_INET6, &a->sin6_addr, buf, sizeof(buf));
+    ip = buf;
+    port = ntohs(a->sin6_port);
+    return true;
+  }
+  return false;
+}
+
+bool EncodeSocks5UdpPacket(const sockaddr *target, int targetLen, const char *payload, int payloadLen, std::vector<char> &out) {
+  if (!target || payloadLen < 0) return false;
+  out.clear();
+  out.push_back(0x00); out.push_back(0x00); // RSV
+  out.push_back(0x00);                       // FRAG
+  if (target->sa_family == AF_INET && targetLen >= (int)sizeof(sockaddr_in)) {
+    const sockaddr_in *a = (const sockaddr_in *)target;
+    out.push_back(0x01);
+    const char *p = (const char *)&a->sin_addr;
+    out.insert(out.end(), p, p + 4);
+    const char *q = (const char *)&a->sin_port;
+    out.insert(out.end(), q, q + 2);
+  } else if (target->sa_family == AF_INET6 && targetLen >= (int)sizeof(sockaddr_in6)) {
+    const sockaddr_in6 *a = (const sockaddr_in6 *)target;
+    out.push_back(0x04);
+    const char *p = (const char *)&a->sin6_addr;
+    out.insert(out.end(), p, p + 16);
+    const char *q = (const char *)&a->sin6_port;
+    out.insert(out.end(), q, q + 2);
+  } else {
+    return false;
+  }
+  out.insert(out.end(), payload, payload + payloadLen);
+  return true;
+}
+
+bool DecodeSocks5UdpPacket(char *packet, int packetLen, char *payload, int payloadCap, int &payloadLen,
+                           sockaddr_storage *from, int *fromLen) {
+  if (packetLen < 10 || (unsigned char)packet[2] != 0x00) return false;
+  int off = 3;
+  unsigned char atyp = (unsigned char)packet[off++];
+  sockaddr_storage src = {};
+  int srcLen = 0;
+  if (atyp == 0x01) {
+    if (packetLen < off + 4 + 2) return false;
+    sockaddr_in *a = (sockaddr_in *)&src;
+    a->sin_family = AF_INET;
+    memcpy(&a->sin_addr, packet + off, 4); off += 4;
+    memcpy(&a->sin_port, packet + off, 2); off += 2;
+    srcLen = sizeof(sockaddr_in);
+  } else if (atyp == 0x04) {
+    if (packetLen < off + 16 + 2) return false;
+    sockaddr_in6 *a = (sockaddr_in6 *)&src;
+    a->sin6_family = AF_INET6;
+    memcpy(&a->sin6_addr, packet + off, 16); off += 16;
+    memcpy(&a->sin6_port, packet + off, 2); off += 2;
+    srcLen = sizeof(sockaddr_in6);
+  } else if (atyp == 0x03) {
+    if (packetLen < off + 1) return false;
+    int n = (unsigned char)packet[off++];
+    if (packetLen < off + n + 2) return false;
+    off += n + 2;
+  } else {
+    return false;
+  }
+  payloadLen = packetLen - off;
+  if (payloadLen < 0 || payloadLen > payloadCap) return false;
+  memcpy(payload, packet + off, payloadLen);
+  if (from && fromLen && *fromLen >= srcLen && srcLen > 0) {
+    memcpy(from, &src, srcLen);
+    *fromLen = srcLen;
+  }
+  return true;
+}
+
+bool Socks5UdpAssociate(SOCKET control, sockaddr_storage &relay, int &relayLen) {
+  unsigned char hello[3] = {0x05, 0x01, 0x00};
+  if (!SyncSend(control, (const char *)hello, sizeof(hello))) return false;
+  unsigned char helloResp[2] = {0};
+  if (!SyncRecvExact(control, (char *)helloResp, sizeof(helloResp))) return false;
+  if (helloResp[0] != 0x05 || helloResp[1] != 0x00) return false;
+
+  unsigned char req[10] = {0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}; // UDP ASSOCIATE 0.0.0.0:0
+  if (!SyncSend(control, (const char *)req, sizeof(req))) return false;
+  unsigned char head[4] = {0};
+  if (!SyncRecvExact(control, (char *)head, sizeof(head))) return false;
+  if (head[0] != 0x05 || head[1] != 0x00) {
+    NetLog("[Proxy] SOCKS5 UDP ASSOCIATE rejected (ver=%u rep=%u atyp=%u)", head[0], head[1], head[3]);
+    return false;
+  }
+
+  memset(&relay, 0, sizeof(relay));
+  if (head[3] == 0x01) {
+    unsigned char addr[4]; unsigned char port[2];
+    if (!SyncRecvExact(control, (char *)addr, 4) || !SyncRecvExact(control, (char *)port, 2)) return false;
+    sockaddr_in *a = (sockaddr_in *)&relay;
+    a->sin_family = AF_INET;
+    memcpy(&a->sin_addr, addr, 4);
+    memcpy(&a->sin_port, port, 2);
+    if (a->sin_addr.s_addr == 0 || a->sin_addr.s_addr == inet_addr("0.0.0.0")) {
+      inet_pton(AF_INET, g_ProxyIP.c_str(), &a->sin_addr);
+    }
+    relayLen = sizeof(sockaddr_in);
+    return true;
+  }
+  if (head[3] == 0x04) {
+    unsigned char addr[16]; unsigned char port[2];
+    if (!SyncRecvExact(control, (char *)addr, 16) || !SyncRecvExact(control, (char *)port, 2)) return false;
+    sockaddr_in6 *a = (sockaddr_in6 *)&relay;
+    a->sin6_family = AF_INET6;
+    memcpy(&a->sin6_addr, addr, 16);
+    memcpy(&a->sin6_port, port, 2);
+    relayLen = sizeof(sockaddr_in6);
+    return true;
+  }
+  if (head[3] == 0x03) {
+    unsigned char n = 0;
+    if (!SyncRecvExact(control, (char *)&n, 1)) return false;
+    std::vector<char> skip(n + 2);
+    if (!SyncRecvExact(control, skip.data(), (int)skip.size())) return false;
+  }
+  return false;
+}
+
+bool EnsureUdpProxyState(SOCKET appSocket, const sockaddr *target, int targetLen, UdpProxyState &copy) {
+  if (g_UdpMode != UdpMode::Proxy || g_ProxyType != ProxyType::Socks5) return false;
+  {
+    std::lock_guard<std::mutex> lock(g_UdpProxyMutex);
+    auto it = g_UdpProxyStates.find(appSocket);
+    if (it != g_UdpProxyStates.end()) {
+      if (target && targetLen > 0) {
+        memset(&it->second.target_addr, 0, sizeof(it->second.target_addr));
+        memcpy(&it->second.target_addr, target, min(targetLen, (int)sizeof(sockaddr_storage)));
+        it->second.target_len = targetLen;
+      }
+      copy = it->second;
+      return copy.udp != INVALID_SOCKET && copy.control != INVALID_SOCKET && copy.target_len > 0;
+    }
+  }
+
+  UdpProxyState st;
+  if (target && targetLen > 0) {
+    memcpy(&st.target_addr, target, min(targetLen, (int)sizeof(sockaddr_storage)));
+    st.target_len = targetLen;
+  }
+  st.control = socket(ProxyAddressIsIPv4() ? AF_INET : AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+  if (st.control == INVALID_SOCKET) return false;
+  DWORD timeout = 10000;
+  setsockopt(st.control, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+  setsockopt(st.control, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof(timeout));
+  if (!ConnectSocketToUpstreamProxy(st.control) || !Socks5UdpAssociate(st.control, st.relay_addr, st.relay_len)) {
+    NetLog("[Proxy] SOCKS5 UDP ASSOCIATE failed (upstream %s:%d)", g_ProxyIP.c_str(), g_ProxyPort);
+    closesocket(st.control);
+    return false;
+  }
+  st.udp = socket(st.relay_addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+  if (st.udp == INVALID_SOCKET) {
+    closesocket(st.control);
+    return false;
+  }
+  setsockopt(st.udp, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+  std::string relayIp; int relayPort = 0, targetPort = 0; std::string targetIp;
+  DescribeSockaddr((sockaddr *)&st.relay_addr, st.relay_len, relayIp, relayPort);
+  DescribeSockaddr((sockaddr *)&st.target_addr, st.target_len, targetIp, targetPort);
+  NetLog("[Proxy] SOCKS5 UDP ASSOCIATE OK: relay %s:%d, target %s:%d",
+         relayIp.c_str(), relayPort, targetIp.c_str(), targetPort);
+
+  {
+    std::lock_guard<std::mutex> lock(g_UdpProxyMutex);
+    g_UdpProxyStates[appSocket] = st;
+    copy = st;
+  }
+  return copy.target_len > 0;
+}
+
+int UdpProxySend(SOCKET appSocket, const char *buf, int len, int flags, const sockaddr *target, int targetLen) {
+  if (g_UdpMode == UdpMode::Direct) return SOCKET_ERROR;
+  if (g_UdpMode == UdpMode::Fail) {
+    WSASetLastError(WSAEHOSTUNREACH);
+    return SOCKET_ERROR;
+  }
+  UdpProxyState st;
+  if (!EnsureUdpProxyState(appSocket, target, targetLen, st)) {
+    WSASetLastError(WSAECONNREFUSED);
+    return SOCKET_ERROR;
+  }
+  std::vector<char> packet;
+  if (!EncodeSocks5UdpPacket((sockaddr *)&st.target_addr, st.target_len, buf, len, packet)) {
+    WSASetLastError(WSAEINVAL);
+    return SOCKET_ERROR;
+  }
+  int n = real_sendto(st.udp, packet.data(), (int)packet.size(), flags, (sockaddr *)&st.relay_addr, st.relay_len);
+  if (n == SOCKET_ERROR) return SOCKET_ERROR;
+  return len;
+}
+
+int UdpProxyRecv(SOCKET appSocket, char *buf, int len, int flags, sockaddr *from, int *fromLen) {
+  UdpProxyState st;
+  if (!EnsureUdpProxyState(appSocket, NULL, 0, st)) {
+    WSASetLastError(WSAECONNREFUSED);
+    return SOCKET_ERROR;
+  }
+  std::vector<char> packet(len + 64);
+  sockaddr_storage peer = {};
+  int peerLen = sizeof(peer);
+  int n = real_recvfrom(st.udp, packet.data(), (int)packet.size(), flags, (sockaddr *)&peer, &peerLen);
+  if (n <= 0) return n;
+  int payloadLen = 0;
+  sockaddr_storage decodedFrom = {};
+  int decodedFromLen = sizeof(decodedFrom);
+  if (!DecodeSocks5UdpPacket(packet.data(), n, buf, len, payloadLen, &decodedFrom, &decodedFromLen)) {
+    WSASetLastError(WSAEMSGSIZE);
+    return SOCKET_ERROR;
+  }
+  if (from && fromLen && *fromLen >= decodedFromLen) {
+    memcpy(from, &decodedFrom, decodedFromLen);
+    *fromLen = decodedFromLen;
+  }
+  return payloadLen;
+}
+
 unsigned short GetDnsQuestionType(const char *buf, int len) {
   if (!buf || len < 16) return 0;
   int off = 12;
@@ -1542,6 +1807,16 @@ BOOL PASCAL hook_ConnectEx(SOCKET s, const struct sockaddr *name, int namelen,
       return FALSE;
     }
     if (!IsStreamSocket(s)) {
+      if (IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+        UdpProxyState st;
+        if (EnsureUdpProxyState(s, name, namelen, st)) {
+          NetLog("[hook] ConnectEx UDP proxy prepared: %s:%d | %s", ip, port, domain.c_str());
+          if (lpBytesSent) *lpBytesSent = 0;
+          return TRUE;
+        }
+        WSASetLastError(WSAECONNREFUSED);
+        return FALSE;
+      }
       if (ShouldRejectUnsupportedUdpConnect(s, "ConnectEx", name->sa_family, ip, port, domain)) {
         return FALSE;
       }
@@ -1613,6 +1888,15 @@ int WINAPI hook_WSAConnect(SOCKET s, const sockaddr *name, int namelen,
       return SOCKET_ERROR;
     }
     if (!IsStreamSocket(s)) {
+      if (IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+        UdpProxyState st;
+        if (EnsureUdpProxyState(s, name, namelen, st)) {
+          NetLog("[hook] WSAConnect UDP proxy prepared: %s:%d | %s", ip, port, domain.c_str());
+          return 0;
+        }
+        WSASetLastError(WSAECONNREFUSED);
+        return SOCKET_ERROR;
+      }
       if (ShouldRejectUnsupportedUdpConnect(s, "WSAConnect", name->sa_family, ip, port, domain)) {
         return SOCKET_ERROR;
       }
@@ -1671,6 +1955,7 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
         sockaddr_in l = *t;
         l.sin_addr.s_addr = inet_addr("127.0.0.1");
         l.sin_port = htons(g_DnsProxyPort);
+        MarkDnsRedirectUdpSocket(s);
         return real_connect(s, (sockaddr *)&l, sizeof(l));
       }
       if (t->sin_addr.s_addr == inet_addr("127.0.0.1"))
@@ -1688,6 +1973,15 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
       return SOCKET_ERROR;
     }
     if (!IsStreamSocket(s)) {
+      if (IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+        UdpProxyState st;
+        if (EnsureUdpProxyState(s, name, namelen, st)) {
+          NetLog("[hook] connect UDP proxy prepared: %s:%d | %s", ip, port, domain.c_str());
+          return 0;
+        }
+        WSASetLastError(WSAECONNREFUSED);
+        return SOCKET_ERROR;
+      }
       if (ShouldRejectUnsupportedUdpConnect(s, "connect", name->sa_family, ip, port, domain)) {
         return SOCKET_ERROR;
       }
@@ -1728,6 +2022,12 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
 
 // --- Lazy handshake send hooks ---
 int WINAPI hook_send(SOCKET s, const char *buf, int len, int flags) {
+  if (IsDnsRedirectUdpSocket(s)) {
+    return real_send(s, buf, len, flags);
+  }
+  if (IsDatagramSocket(s) && g_UdpMode != UdpMode::Direct) {
+    return UdpProxySend(s, buf, len, flags, NULL, 0);
+  }
   if (!CompletePendingHandshake(s)) {
     WSASetLastError(WSAECONNRESET);
     return SOCKET_ERROR;
@@ -1739,6 +2039,27 @@ int WINAPI hook_WSASend(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
                          LPDWORD lpNumberOfBytesSent, DWORD dwFlags,
                          LPWSAOVERLAPPED lpOverlapped,
                          LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
+  if (IsDnsRedirectUdpSocket(s)) {
+    return real_WSASend(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent,
+                        dwFlags, lpOverlapped, lpCompletionRoutine);
+  }
+  if (IsDatagramSocket(s) && g_UdpMode != UdpMode::Direct) {
+    if (lpOverlapped || lpCompletionRoutine || dwBufferCount == 0) {
+      WSASetLastError(WSAEOPNOTSUPP);
+      return SOCKET_ERROR;
+    }
+    DWORD total = 0;
+    for (DWORD i = 0; i < dwBufferCount; ++i) total += lpBuffers[i].len;
+    std::vector<char> merged(total);
+    DWORD off = 0;
+    for (DWORD i = 0; i < dwBufferCount; ++i) {
+      memcpy(merged.data() + off, lpBuffers[i].buf, lpBuffers[i].len);
+      off += lpBuffers[i].len;
+    }
+    int ret = UdpProxySend(s, merged.data(), (int)merged.size(), dwFlags, NULL, 0);
+    if (ret != SOCKET_ERROR && lpNumberOfBytesSent) *lpNumberOfBytesSent = (DWORD)ret;
+    return ret == SOCKET_ERROR ? SOCKET_ERROR : 0;
+  }
   if (!CompletePendingHandshake(s)) {
     WSASetLastError(WSAECONNRESET);
     return SOCKET_ERROR;
@@ -1749,6 +2070,12 @@ int WINAPI hook_WSASend(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
 
 
 int WINAPI hook_recv(SOCKET s, char *buf, int len, int flags) {
+  if (IsDnsRedirectUdpSocket(s)) {
+    return real_recv(s, buf, len, flags);
+  }
+  if (IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+    return UdpProxyRecv(s, buf, len, flags, NULL, NULL);
+  }
   if (!CompletePendingHandshake(s)) {
     WSASetLastError(WSAECONNRESET);
     return SOCKET_ERROR;
@@ -1760,6 +2087,20 @@ int WINAPI hook_WSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
                         LPDWORD lpNumberOfBytesRecvd, LPDWORD lpFlags,
                         LPWSAOVERLAPPED lpOverlapped,
                         LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
+  if (IsDnsRedirectUdpSocket(s)) {
+    return real_WSARecv(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags,
+                        lpOverlapped, lpCompletionRoutine);
+  }
+  if (IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+    if (lpOverlapped || lpCompletionRoutine || dwBufferCount == 0) {
+      WSASetLastError(WSAEOPNOTSUPP);
+      return SOCKET_ERROR;
+    }
+    DWORD flags = lpFlags ? *lpFlags : 0;
+    int ret = UdpProxyRecv(s, lpBuffers[0].buf, lpBuffers[0].len, flags, NULL, NULL);
+    if (ret != SOCKET_ERROR && lpNumberOfBytesRecvd) *lpNumberOfBytesRecvd = (DWORD)ret;
+    return ret == SOCKET_ERROR ? SOCKET_ERROR : 0;
+  }
   if (!CompletePendingHandshake(s)) {
     WSASetLastError(WSAECONNRESET);
     return SOCKET_ERROR;
@@ -1776,7 +2117,11 @@ int WINAPI hook_sendto(SOCKET s, const char *buf, int len, int flags,
     l.sin_addr.s_addr = inet_addr("127.0.0.1");
     l.sin_port = htons(g_DnsProxyPort);
     NetLog("[DNS] hook_sendto: Translated to 127.0.0.1:%d", g_DnsProxyPort);
+    MarkDnsRedirectUdpSocket(s);
     return real_sendto(s, buf, len, flags, (sockaddr *)&l, sizeof(l));
+  }
+  if (to && IsDatagramSocket(s) && g_UdpMode != UdpMode::Direct) {
+    return UdpProxySend(s, buf, len, flags, to, tolen);
   }
   return real_sendto(s, buf, len, flags, to, tolen);
 }
@@ -1792,9 +2137,27 @@ int WINAPI hook_WSASendTo(
     l.sin_addr.s_addr = inet_addr("127.0.0.1");
     l.sin_port = htons(g_DnsProxyPort);
     NetLog("[DNS] hook_WSASendTo: Translated to 127.0.0.1:%d", g_DnsProxyPort);
+    MarkDnsRedirectUdpSocket(s);
     return real_WSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent,
                           dwFlags, (sockaddr *)&l, sizeof(l), lpOverlapped,
                           lpCompletionRoutine);
+  }
+  if (lpTo && IsDatagramSocket(s) && g_UdpMode != UdpMode::Direct) {
+    if (lpOverlapped || lpCompletionRoutine || dwBufferCount == 0) {
+      WSASetLastError(WSAEOPNOTSUPP);
+      return SOCKET_ERROR;
+    }
+    DWORD total = 0;
+    for (DWORD i = 0; i < dwBufferCount; ++i) total += lpBuffers[i].len;
+    std::vector<char> merged(total);
+    DWORD off = 0;
+    for (DWORD i = 0; i < dwBufferCount; ++i) {
+      memcpy(merged.data() + off, lpBuffers[i].buf, lpBuffers[i].len);
+      off += lpBuffers[i].len;
+    }
+    int ret = UdpProxySend(s, merged.data(), (int)merged.size(), dwFlags, lpTo, iTolen);
+    if (ret != SOCKET_ERROR && lpNumberOfBytesSent) *lpNumberOfBytesSent = (DWORD)ret;
+    return ret == SOCKET_ERROR ? SOCKET_ERROR : 0;
   }
   return real_WSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent,
                         dwFlags, lpTo, iTolen, lpOverlapped,
@@ -1803,6 +2166,9 @@ int WINAPI hook_WSASendTo(
 
 int WINAPI hook_recvfrom(SOCKET s, char *buf, int len, int flags,
                          struct sockaddr *from, int *fromlen) {
+  if (!IsDnsRedirectUdpSocket(s) && IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+    return UdpProxyRecv(s, buf, len, flags, from, fromlen);
+  }
   int ret = real_recvfrom(s, buf, len, flags, from, fromlen);
   if (ret > 0 && from && fromlen && *fromlen >= sizeof(sockaddr_in)) {
     sockaddr_in *f = (sockaddr_in *)from;
@@ -1859,6 +2225,16 @@ int WINAPI hook_WSARecvFrom(
     LPDWORD lpNumberOfBytesRecvd, LPDWORD lpFlags, struct sockaddr *lpFrom,
     LPINT lpFromlen, LPWSAOVERLAPPED lpOverlapped,
     LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
+  if (!IsDnsRedirectUdpSocket(s) && IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+    if (lpOverlapped || lpCompletionRoutine || dwBufferCount == 0) {
+      WSASetLastError(WSAEOPNOTSUPP);
+      return SOCKET_ERROR;
+    }
+    DWORD flags = lpFlags ? *lpFlags : 0;
+    int n = UdpProxyRecv(s, lpBuffers[0].buf, lpBuffers[0].len, flags, lpFrom, lpFromlen);
+    if (n != SOCKET_ERROR && lpNumberOfBytesRecvd) *lpNumberOfBytesRecvd = (DWORD)n;
+    return n == SOCKET_ERROR ? SOCKET_ERROR : 0;
+  }
   int ret = real_WSARecvFrom(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd,
                              lpFlags, lpFrom, lpFromlen, lpOverlapped,
                              lpCompletionRoutine);
@@ -2229,11 +2605,13 @@ DWORD WINAPI SetupThread(LPVOID lpParam) {
   MH_EnableHook(MH_ALL_HOOKS);
   const char *ipv6ConnectMode = g_Ipv6ConnectMode == Ipv6ConnectMode::Direct ? "direct" :
                                 (g_Ipv6ConnectMode == Ipv6ConnectMode::Fail ? "fail" : "proxy");
-  NetLog("[Init] Hooks installed successfully (PID: %d, proxy: %s://%s:%d, dns: %s, dns_server: %s:%d, dns_ipv6: %s, ipv6_connect: %s, direct domains: %d, direct IP rules: %d)",
+  const char *udpMode = g_UdpMode == UdpMode::Direct ? "direct" :
+                       (g_UdpMode == UdpMode::Fail ? "fail" : "proxy");
+  NetLog("[Init] Hooks installed successfully (PID: %d, proxy: %s://%s:%d, dns: %s, dns_server: %s:%d, dns_ipv6: %s, ipv6_connect: %s, udp: %s, direct domains: %d, direct IP rules: %d)",
          GetCurrentProcessId(), g_ProxyType == ProxyType::Socks5 ? "socks5" : "http",
          g_ProxyIP.c_str(), g_ProxyPort, g_DnsMode == DnsMode::Proxy ? "proxy" : "system",
          g_DnsServerIP.c_str(), g_DnsServerPort, g_DnsIpv6 ? "on" : "off", ipv6ConnectMode,
-         (int)g_DirectDomains.size(), (int)g_DirectIpRules.size());
+         udpMode, (int)g_DirectDomains.size(), (int)g_DirectIpRules.size());
   } __except(EXCEPTION_EXECUTE_HANDLER) {
     // Silently absorb any crash during initialization
     // This prevents crashing the host process (e.g., Chrome Network Service)
@@ -2254,6 +2632,18 @@ DWORD WINAPI CleanupThread(LPVOID lpParam) {
     std::lock_guard<std::mutex> lock(g_DnsPoolMutex);
     for (auto &conn : g_DnsPool) closesocket(conn.sock);
     g_DnsPool.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_UdpProxyMutex);
+    for (auto &kv : g_UdpProxyStates) {
+      if (kv.second.udp != INVALID_SOCKET) closesocket(kv.second.udp);
+      if (kv.second.control != INVALID_SOCKET) closesocket(kv.second.control);
+    }
+    g_UdpProxyStates.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_DnsRedirectUdpMutex);
+    g_DnsRedirectUdpSockets.clear();
   }
   if (g_LogSocket != INVALID_SOCKET) {
     closesocket(g_LogSocket);

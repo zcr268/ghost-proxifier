@@ -28,6 +28,9 @@ dns_server=8.8.8.8:53
 dns_ipv6=on
 # IPv6 TCP connect handling: proxy=forward via upstream proxy, direct=let system handle it, fail=fast fail.
 ipv6_connect=proxy
+# UDP handling: proxy=SOCKS5 UDP ASSOCIATE, direct=system UDP, fail=fast fail.
+# Requires a SOCKS5 upstream with UDP support.
+udp=proxy
 
 # Direct connection rules: use normal LAN/VPN route instead of HTTP CONNECT/SOCKS5 proxy.
 # Local loopback is direct by default so the app can still talk to local services.
