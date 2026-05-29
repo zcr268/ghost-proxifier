@@ -17,7 +17,7 @@ process=Codex.exe
 log_max_mb=10
 # GUI mode: start silently in the system tray instead of opening the log window.
 # Double-click the tray icon or right-click -> Open Logs to show it.
-start_minimized_to_tray=off
+start_minimized_to_tray=on
 # DNS handling:
 # dns=proxy forwards DNS queries through the configured upstream proxy to dns_server.
 # dns=system disables Ghost's DNS proxy and uses the process/system DNS directly.

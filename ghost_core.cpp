@@ -107,6 +107,7 @@ int g_DnsProxyPort = 0;
 std::atomic<bool> g_Running{true};
 
 // --- Forward Declarations ---
+struct PendingProxy;
 // --- Domain Reverse Map (Real IP -> Domain) ---
 std::unordered_map<DWORD, std::string> g_IpToDomainMap;
 std::mutex g_IpMapMutex;
@@ -130,6 +131,9 @@ bool GetDomainByRealIp(DWORD net_ip, std::string& domain) {
 void NetLog(const char *format, ...);
 bool PerformProxyConnect(SOCKET s, const char *ip_str, int port, int family, const std::string& domain = "");
 bool BuildProxySockaddrForSocket(SOCKET s, int socket_family, sockaddr_storage &proxy_addr, int &proxy_len);
+bool PrepareIpv6RelayForSocket(SOCKET s, const PendingProxy &target, sockaddr_storage &relay_addr, int &relay_len);
+void RemoveIpv6RelayTargetForSocket(SOCKET s);
+bool ProxyAddressIsIPv4();
 
 // --- Pending Proxy (Lazy Handshake) ---
 struct PendingProxy {
@@ -141,6 +145,16 @@ struct PendingProxy {
 };
 std::unordered_map<SOCKET, PendingProxy> g_PendingProxySockets;
 std::mutex g_PendingMutex;
+
+// IPv6-only sockets cannot connect to an IPv4 upstream proxy address (for example
+// socks5://127.0.0.1:7890).  For those sockets we redirect to a tiny per-process
+// ::1 TCP relay.  The relay uses its own IPv4 socket to talk to the upstream proxy
+// and then pipes bytes between the app socket and the proxy-connected socket.
+std::unordered_map<unsigned short, PendingProxy> g_Ipv6RelayTargets;
+std::mutex g_Ipv6RelayMutex;
+SOCKET g_Ipv6RelayListen = INVALID_SOCKET;
+int g_Ipv6RelayPort = 0;
+std::atomic<bool> g_Ipv6RelayStarting{false};
 
 // Complete deferred proxy handshake before the first socket I/O.
 bool CompletePendingHandshake(SOCKET s) {
@@ -612,6 +626,228 @@ void LogDirectConnectIfUseful(const char *api, const char *ip, int port, const s
   if (family == AF_INET6 && !is_local && g_Ipv6ConnectMode == Ipv6ConnectMode::Direct) {
     NetLog("[hook] %s direct IPv6: %s:%d | %s (ipv6_connect=direct)",
            api, ip, port, domain.c_str());
+  }
+}
+
+bool ProxyAddressIsIPv4() {
+  in_addr a4;
+  return inet_pton(AF_INET, g_ProxyIP.c_str(), &a4) == 1;
+}
+
+struct RelayWorkerParam {
+  SOCKET client;
+  PendingProxy target;
+};
+
+bool ConnectSocketToUpstreamProxy(SOCKET s) {
+  in_addr a4;
+  in6_addr a6;
+  if (inet_pton(AF_INET, g_ProxyIP.c_str(), &a4) == 1) {
+    sockaddr_in p = {};
+    p.sin_family = AF_INET;
+    p.sin_addr = a4;
+    p.sin_port = htons(g_ProxyPort);
+    return real_connect && real_connect(s, (sockaddr *)&p, sizeof(p)) == 0;
+  }
+  if (inet_pton(AF_INET6, g_ProxyIP.c_str(), &a6) == 1) {
+    sockaddr_in6 p6 = {};
+    p6.sin6_family = AF_INET6;
+    p6.sin6_addr = a6;
+    p6.sin6_port = htons(g_ProxyPort);
+    return real_connect && real_connect(s, (sockaddr *)&p6, sizeof(p6)) == 0;
+  }
+  return false;
+}
+
+bool RelayPumpOnce(SOCKET from, SOCKET to, char *buf, int bufSize) {
+  int n = real_recv(from, buf, bufSize, 0);
+  if (n <= 0) return false;
+  int sent = 0;
+  while (sent < n) {
+    int m = real_send(to, buf + sent, n - sent, 0);
+    if (m <= 0) return false;
+    sent += m;
+  }
+  return true;
+}
+
+DWORD WINAPI Ipv6RelayWorkerThread(LPVOID param) {
+  RelayWorkerParam *rp = (RelayWorkerParam *)param;
+  SOCKET client = rp->client;
+  PendingProxy target = rp->target;
+  delete rp;
+
+  SOCKET upstream = socket(ProxyAddressIsIPv4() ? AF_INET : AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+  if (upstream == INVALID_SOCKET) {
+    closesocket(client);
+    return 0;
+  }
+  if (!ConnectSocketToUpstreamProxy(upstream)) {
+    NetLog("[Proxy] IPv6 relay failed to connect upstream %s:%d for %s:%d | %s (err=%d)",
+           g_ProxyIP.c_str(), g_ProxyPort, target.target_ip.c_str(), target.target_port,
+           target.domain.c_str(), WSAGetLastError());
+    closesocket(upstream);
+    closesocket(client);
+    return 0;
+  }
+  if (!PerformProxyConnect(upstream, target.target_ip.c_str(), target.target_port, target.target_family, target.domain)) {
+    NetLog("[Proxy] IPv6 relay proxy handshake failed: %s:%d | %s",
+           target.target_ip.c_str(), target.target_port, target.domain.c_str());
+    closesocket(upstream);
+    closesocket(client);
+    return 0;
+  }
+  if (!target.initial_data.empty()) {
+    int sent = 0;
+    while (sent < (int)target.initial_data.size()) {
+      int n = real_send(upstream, target.initial_data.data() + sent,
+                        (int)target.initial_data.size() - sent, 0);
+      if (n <= 0) {
+        closesocket(upstream);
+        closesocket(client);
+        return 0;
+      }
+      sent += n;
+    }
+  }
+
+  char buf[16384];
+  while (g_Running.load()) {
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(client, &rfds);
+    FD_SET(upstream, &rfds);
+    timeval tv = {30, 0};
+    int r = select(0, &rfds, NULL, NULL, &tv);
+    if (r <= 0) continue;
+    if (FD_ISSET(client, &rfds) && !RelayPumpOnce(client, upstream, buf, sizeof(buf))) break;
+    if (FD_ISSET(upstream, &rfds) && !RelayPumpOnce(upstream, client, buf, sizeof(buf))) break;
+  }
+  closesocket(upstream);
+  closesocket(client);
+  return 0;
+}
+
+DWORD WINAPI Ipv6RelayAcceptThread(LPVOID) {
+  while (g_Running.load()) {
+    sockaddr_in6 peer = {};
+    int peerLen = sizeof(peer);
+    SOCKET c = accept(g_Ipv6RelayListen, (sockaddr *)&peer, &peerLen);
+    if (c == INVALID_SOCKET) break;
+    unsigned short port = ntohs(peer.sin6_port);
+    PendingProxy target;
+    bool found = false;
+    {
+      std::lock_guard<std::mutex> lock(g_Ipv6RelayMutex);
+      auto it = g_Ipv6RelayTargets.find(port);
+      if (it != g_Ipv6RelayTargets.end()) {
+        target = it->second;
+        g_Ipv6RelayTargets.erase(it);
+        found = true;
+      }
+    }
+    if (!found) {
+      NetLog("[Proxy] IPv6 relay accepted unknown local port %u; closing", port);
+      closesocket(c);
+      continue;
+    }
+    RelayWorkerParam *rp = new RelayWorkerParam{c, target};
+    HANDLE h = CreateThread(NULL, 0, Ipv6RelayWorkerThread, rp, 0, NULL);
+    if (h) CloseHandle(h);
+    else { delete rp; closesocket(c); }
+  }
+  return 0;
+}
+
+bool EnsureIpv6RelayStarted() {
+  if (g_Ipv6RelayListen != INVALID_SOCKET && g_Ipv6RelayPort > 0) return true;
+  bool expected = false;
+  if (!g_Ipv6RelayStarting.compare_exchange_strong(expected, true)) {
+    for (int i = 0; i < 100; ++i) {
+      if (g_Ipv6RelayListen != INVALID_SOCKET && g_Ipv6RelayPort > 0) return true;
+      Sleep(10);
+    }
+    return false;
+  }
+
+  SOCKET ls = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+  if (ls == INVALID_SOCKET) {
+    g_Ipv6RelayStarting.store(false);
+    return false;
+  }
+  DWORD on = 1;
+  setsockopt(ls, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&on, sizeof(on));
+  sockaddr_in6 a = {};
+  a.sin6_family = AF_INET6;
+  inet_pton(AF_INET6, "::1", &a.sin6_addr);
+  a.sin6_port = htons(0);
+  if (bind(ls, (sockaddr *)&a, sizeof(a)) != 0 || listen(ls, SOMAXCONN) != 0) {
+    NetLog("[Proxy] Failed to start IPv6 loopback relay on ::1 (err=%d)", WSAGetLastError());
+    closesocket(ls);
+    g_Ipv6RelayStarting.store(false);
+    return false;
+  }
+  int len = sizeof(a);
+  if (getsockname(ls, (sockaddr *)&a, &len) != 0) {
+    closesocket(ls);
+    g_Ipv6RelayStarting.store(false);
+    return false;
+  }
+  g_Ipv6RelayListen = ls;
+  g_Ipv6RelayPort = ntohs(a.sin6_port);
+  HANDLE h = CreateThread(NULL, 0, Ipv6RelayAcceptThread, NULL, 0, NULL);
+  if (h) CloseHandle(h);
+  NetLog("[Proxy] IPv6 loopback relay ready on [::1]:%d -> %s:%d", g_Ipv6RelayPort, g_ProxyIP.c_str(), g_ProxyPort);
+  g_Ipv6RelayStarting.store(false);
+  return true;
+}
+
+bool PrepareIpv6RelayForSocket(SOCKET s, const PendingProxy &target, sockaddr_storage &relay_addr, int &relay_len) {
+  if (!EnsureIpv6RelayStarted()) return false;
+
+  sockaddr_storage local = {};
+  int localLen = sizeof(local);
+  if (getsockname(s, (sockaddr *)&local, &localLen) != 0 || local.ss_family != AF_INET6 || ntohs(((sockaddr_in6 *)&local)->sin6_port) == 0) {
+    sockaddr_in6 bindAddr = {};
+    bindAddr.sin6_family = AF_INET6;
+    inet_pton(AF_INET6, "::1", &bindAddr.sin6_addr);
+    bindAddr.sin6_port = htons(0);
+    if (bind(s, (sockaddr *)&bindAddr, sizeof(bindAddr)) != 0) {
+      NetLog("[Proxy] IPv6 relay failed to bind client socket to ::1:0 for %s:%d | %s (err=%d)",
+             target.target_ip.c_str(), target.target_port, target.domain.c_str(), WSAGetLastError());
+      return false;
+    }
+    localLen = sizeof(local);
+    if (getsockname(s, (sockaddr *)&local, &localLen) != 0 || local.ss_family != AF_INET6) return false;
+  }
+  unsigned short clientPort = ntohs(((sockaddr_in6 *)&local)->sin6_port);
+  if (clientPort == 0) return false;
+  {
+    std::lock_guard<std::mutex> lock(g_Ipv6RelayMutex);
+    g_Ipv6RelayTargets[clientPort] = target;
+  }
+
+  memset(&relay_addr, 0, sizeof(relay_addr));
+  sockaddr_in6 *r = (sockaddr_in6 *)&relay_addr;
+  r->sin6_family = AF_INET6;
+  inet_pton(AF_INET6, "::1", &r->sin6_addr);
+  r->sin6_port = htons(g_Ipv6RelayPort);
+  relay_len = sizeof(sockaddr_in6);
+  NetLog("[hook] IPv6 relay redirect: %s:%d | %s via [::1]:%d (upstream %s:%d)",
+         target.target_ip.c_str(), target.target_port, target.domain.c_str(),
+         g_Ipv6RelayPort, g_ProxyIP.c_str(), g_ProxyPort);
+  return true;
+}
+
+void RemoveIpv6RelayTargetForSocket(SOCKET s) {
+  sockaddr_storage local = {};
+  int localLen = sizeof(local);
+  if (getsockname(s, (sockaddr *)&local, &localLen) == 0 && local.ss_family == AF_INET6) {
+    unsigned short clientPort = ntohs(((sockaddr_in6 *)&local)->sin6_port);
+    if (clientPort) {
+      std::lock_guard<std::mutex> lock(g_Ipv6RelayMutex);
+      g_Ipv6RelayTargets.erase(clientPort);
+    }
   }
 }
 
@@ -1223,23 +1459,31 @@ BOOL PASCAL hook_ConnectEx(SOCKET s, const struct sockaddr *name, int namelen,
     }
     if (!ShouldDirectConnect(ip, port, domain, name->sa_family, is_local)) {
       NetLog("[hook] ConnectEx: %s:%d | %s", ip, port, domain.c_str());
-      // Save target info + initial data for deferred handshake
       PendingProxy pp = {ip, port, name->sa_family, domain, {}};
       if (lpSendBuffer && dwSendDataLength > 0) {
         pp.initial_data.assign((char*)lpSendBuffer, (char*)lpSendBuffer + dwSendDataLength);
       }
-      {
-        std::lock_guard<std::mutex> lock(g_PendingMutex);
-        g_PendingProxySockets[s] = std::move(pp);
-      }
       // Redirect ConnectEx to proxy, suppress initial data (will be sent after handshake)
       sockaddr_storage p;
       int pLen = 0;
-      if (!BuildProxySockaddrForSocket(s, name->sa_family, p, pLen)) {
-        WSASetLastError(WSAEADDRNOTAVAIL);
-        return FALSE;
+      bool usingRelay = false;
+      if (name->sa_family == AF_INET6 && ProxyAddressIsIPv4()) {
+        int v6only = 0;
+        int optlen = sizeof(v6only);
+        getsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&v6only, &optlen);
+        if (v6only != 0) usingRelay = PrepareIpv6RelayForSocket(s, pp, p, pLen);
       }
-      return real_ConnectEx(s, (const sockaddr *)&p, pLen, NULL, 0, lpBytesSent, lpOverlapped);
+      if (!usingRelay) {
+        if (!BuildProxySockaddrForSocket(s, name->sa_family, p, pLen)) {
+          WSASetLastError(WSAEADDRNOTAVAIL);
+          return FALSE;
+        }
+        std::lock_guard<std::mutex> lock(g_PendingMutex);
+        g_PendingProxySockets[s] = std::move(pp);
+      }
+      BOOL ret = real_ConnectEx(s, (const sockaddr *)&p, pLen, NULL, 0, lpBytesSent, lpOverlapped);
+      if (!ret && usingRelay) RemoveIpv6RelayTargetForSocket(s);
+      return ret;
     } else {
       LogDirectConnectIfUseful("ConnectEx", ip, port, domain, name->sa_family, is_local);
     }
@@ -1282,19 +1526,28 @@ int WINAPI hook_WSAConnect(SOCKET s, const sockaddr *name, int namelen,
     }
     if (!ShouldDirectConnect(ip, port, domain, name->sa_family, is_local)) {
       NetLog("[hook] WSAConnect: %s:%d | %s", ip, port, domain.c_str());
-      // Save target info for deferred HTTP CONNECT handshake
-      {
-        std::lock_guard<std::mutex> lock(g_PendingMutex);
-        g_PendingProxySockets[s] = {ip, port, name->sa_family, domain, {}};
-      }
+      PendingProxy pp = {ip, port, name->sa_family, domain, {}};
       // Redirect connect to proxy (keep original socket blocking mode)
       sockaddr_storage p;
       int pLen = 0;
-      if (!BuildProxySockaddrForSocket(s, name->sa_family, p, pLen)) {
-        WSASetLastError(WSAEADDRNOTAVAIL);
-        return SOCKET_ERROR;
+      bool usingRelay = false;
+      if (name->sa_family == AF_INET6 && ProxyAddressIsIPv4()) {
+        int v6only = 0;
+        int optlen = sizeof(v6only);
+        getsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&v6only, &optlen);
+        if (v6only != 0) usingRelay = PrepareIpv6RelayForSocket(s, pp, p, pLen);
       }
-      return real_WSAConnect(s, (const sockaddr *)&p, pLen, NULL, NULL, lpSQOS, lpGQOS);
+      if (!usingRelay) {
+        if (!BuildProxySockaddrForSocket(s, name->sa_family, p, pLen)) {
+          WSASetLastError(WSAEADDRNOTAVAIL);
+          return SOCKET_ERROR;
+        }
+        std::lock_guard<std::mutex> lock(g_PendingMutex);
+        g_PendingProxySockets[s] = pp;
+      }
+      int ret = real_WSAConnect(s, (const sockaddr *)&p, pLen, NULL, NULL, lpSQOS, lpGQOS);
+      if (ret == SOCKET_ERROR && usingRelay) RemoveIpv6RelayTargetForSocket(s);
+      return ret;
     } else {
       LogDirectConnectIfUseful("WSAConnect", ip, port, domain, name->sa_family, is_local);
     }
@@ -1344,19 +1597,28 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
     }
     if (!ShouldDirectConnect(ip, port, domain, name->sa_family, is_local)) {
       NetLog("[hook] connect: %s:%d | %s", ip, port, domain.c_str());
-      // Save target info for deferred HTTP CONNECT handshake
-      {
-        std::lock_guard<std::mutex> lock(g_PendingMutex);
-        g_PendingProxySockets[s] = {ip, port, name->sa_family, domain, {}};
-      }
+      PendingProxy pp = {ip, port, name->sa_family, domain, {}};
       // Redirect connect to proxy (keep original socket blocking mode)
       sockaddr_storage p;
       int pLen = 0;
-      if (!BuildProxySockaddrForSocket(s, name->sa_family, p, pLen)) {
-        WSASetLastError(WSAEADDRNOTAVAIL);
-        return SOCKET_ERROR;
+      bool usingRelay = false;
+      if (name->sa_family == AF_INET6 && ProxyAddressIsIPv4()) {
+        int v6only = 0;
+        int optlen = sizeof(v6only);
+        getsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&v6only, &optlen);
+        if (v6only != 0) usingRelay = PrepareIpv6RelayForSocket(s, pp, p, pLen);
       }
-      return real_connect(s, (const sockaddr *)&p, pLen);
+      if (!usingRelay) {
+        if (!BuildProxySockaddrForSocket(s, name->sa_family, p, pLen)) {
+          WSASetLastError(WSAEADDRNOTAVAIL);
+          return SOCKET_ERROR;
+        }
+        std::lock_guard<std::mutex> lock(g_PendingMutex);
+        g_PendingProxySockets[s] = pp;
+      }
+      int ret = real_connect(s, (const sockaddr *)&p, pLen);
+      if (ret == SOCKET_ERROR && usingRelay) RemoveIpv6RelayTargetForSocket(s);
+      return ret;
     } else {
       LogDirectConnectIfUseful("connect", ip, port, domain, name->sa_family, is_local);
     }

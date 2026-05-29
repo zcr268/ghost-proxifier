@@ -966,8 +966,12 @@ int AppMain(int argc, char *argv[]) {
   std::string exeDir = GetExeDir();
   std::string runtimeConfigPath = exeDir + "\\ghost.conf";
   std::string configReadPath = configPath;
-  if (!configFromCli && !FileExists(configReadPath) && FileExists(runtimeConfigPath)) {
-    configReadPath = runtimeConfigPath;
+  if (!configFromCli) {
+    // For double-click/shortcut use, prefer the config shipped next to the EXE.
+    // The previous cwd-first behavior made a stale ghost.conf in another working
+    // directory silently override the extracted release config.
+    if (FileExists(runtimeConfigPath)) configReadPath = runtimeConfigPath;
+    else if (!FileExists(configReadPath)) configReadPath = runtimeConfigPath;
   }
 
   LoadInjectorLogConfig(configReadPath);
