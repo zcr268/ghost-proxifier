@@ -1,5 +1,7 @@
+﻿#include "resource.h"
 #include <winsock2.h>
 #include <windows.h>
+#include <richedit.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <psapi.h>
@@ -26,6 +28,7 @@
 #define ID_TRAY_EXIT 1002
 #define ID_LOG_CLEAR 1003
 #define ID_LOG_COPY 1004
+#define ID_TRAY_AUTOSTART 1005
 #define WM_APPEND_LOG (WM_APP + 2)
 
 static HWND g_trayWnd = NULL;
@@ -39,6 +42,37 @@ static std::deque<std::string> g_pendingLogs;
 static std::ofstream g_logFile;
 static std::streambuf *g_oldCoutBuf = nullptr;
 static std::streambuf *g_oldCerrBuf = nullptr;
+
+
+static bool IsAutoStartEnabled() {
+  HKEY hKey;
+  if (RegOpenKeyExA(HKEY_CURRENT_USER,
+      "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+      0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
+  char val[MAX_PATH] = {0};
+  DWORD sz = sizeof(val);
+  DWORD type = 0;
+  bool ok = (RegQueryValueExA(hKey, "GhostProxifier", NULL, &type,
+              (LPBYTE)val, &sz) == ERROR_SUCCESS);
+  RegCloseKey(hKey);
+  return ok;
+}
+
+static void SetAutoStart(bool enable) {
+  HKEY hKey;
+  if (RegOpenKeyExA(HKEY_CURRENT_USER,
+      "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+      0, KEY_WRITE, &hKey) != ERROR_SUCCESS) return;
+  if (enable) {
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(GetModuleHandleA(NULL), exePath, MAX_PATH);
+    RegSetValueExA(hKey, "GhostProxifier", 0, REG_SZ,
+        (const BYTE*)exePath, (DWORD)strlen(exePath) + 1);
+  } else {
+    RegDeleteValueA(hKey, "GhostProxifier");
+  }
+  RegCloseKey(hKey);
+}
 
 bool IsGuiBuild() {
 #ifdef GHOST_GUI_BUILD
@@ -113,6 +147,19 @@ void FlushPendingLogsToEdit() {
     SendMessageA(g_logEdit, EM_SETSEL, len, len);
     SendMessageA(g_logEdit, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text.c_str()));
   }
+  TrimLogLines();
+  SendMessageA(g_logEdit, WM_VSCROLL, SB_BOTTOM, 0);
+}
+
+static void TrimLogLines() {
+  if (!g_logEdit) return;
+  int totalLines = (int)SendMessageA(g_logEdit, EM_GETLINECOUNT, 0, 0);
+  if (totalLines > 2000) {
+    int excess = totalLines - 1500;
+    int delChars = (int)SendMessageA(g_logEdit, EM_LINEINDEX, excess, 0);
+    SendMessageA(g_logEdit, EM_SETSEL, 0, delChars);
+    SendMessageA(g_logEdit, EM_REPLACESEL, FALSE, (LPARAM)"");
+  }
 }
 
 void AppendLogTextToEdit(const std::string &text) {
@@ -120,6 +167,8 @@ void AppendLogTextToEdit(const std::string &text) {
   int len = GetWindowTextLengthA(g_logEdit);
   SendMessageA(g_logEdit, EM_SETSEL, len, len);
   SendMessageA(g_logEdit, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text.c_str()));
+  TrimLogLines();
+  SendMessageA(g_logEdit, WM_VSCROLL, SB_BOTTOM, 0);
 }
 
 void InstallUiLogCapture() {
@@ -257,16 +306,43 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
   switch (msg) {
     case WM_CREATE: {
       if (IsGuiBuild()) {
+        LoadLibraryA("msftedit.dll");
+        LoadLibraryA("riched20.dll");
+        LoadLibraryA("riched32.dll");
         g_logEdit = CreateWindowExA(
-            WS_EX_CLIENTEDGE, "EDIT", "",
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_LEFT | ES_MULTILINE |
-                ES_AUTOVSCROLL | ES_READONLY,
+            WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, "",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_LEFT | ES_MULTILINE |
+            ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
             0, 0, 0, 0, hwnd, NULL, GetModuleHandleA(NULL), NULL);
+        if (!g_logEdit) {
+            g_logEdit = CreateWindowExA(
+                WS_EX_CLIENTEDGE, "EDIT", "",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_LEFT | ES_MULTILINE |
+                ES_AUTOVSCROLL | ES_READONLY,
+                0, 0, 0, 0, hwnd, NULL, GetModuleHandleA(NULL), NULL);
+        }
         if (g_logEdit) {
-          SendMessageA(g_logEdit, WM_SETFONT, (WPARAM)GetStockObject(ANSI_FIXED_FONT), TRUE);
+          if (g_logEdit) {
+            LOGFONT lf = {};
+            lf.lfHeight = -14;
+            lf.lfCharSet = GB2312_CHARSET;
+            strcpy_s(lf.lfFaceName, "Consolas");
+            HFONT hFont = CreateFontIndirectA(&lf);
+            if (hFont) SendMessageA(g_logEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+        }
           FlushPendingLogsToEdit();
         }
-        AppendLogToUi("[Injector] UI log window ready. Close hides to tray; right-click tray icon -> Exit really quits.\r\n");
+                AppendLogToUi("[Injector] UI log window ready. Close hides to tray; right-click tray icon -> Exit really quits.\r\n");
+        if (IsGuiBuild() && g_logEdit) {
+            SendMessageA(g_logEdit, EM_SETBKGNDCOLOR, 0, RGB(18, 18, 24));
+            CHARFORMAT2 cf;
+            memset(&cf, 0, sizeof(cf));
+            cf.cbSize = sizeof(cf);
+            cf.dwMask = CFM_COLOR;
+            cf.crTextColor = RGB(180, 220, 180);
+            SendMessageA(g_logEdit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+            SendMessageA(g_logEdit, EM_SETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);
+        }
       } else {
         SetTimer(hwnd, 1, 500, NULL);
       }
@@ -305,6 +381,8 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
           AppendMenuA(menu, MF_STRING, ID_LOG_CLEAR, "Clear Logs");
         }
         AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+        bool autoStart = IsAutoStartEnabled();
+        AppendMenuA(menu, MF_STRING | (autoStart ? MF_CHECKED : 0), ID_TRAY_AUTOSTART, "Auto-Start");
         AppendMenuA(menu, MF_STRING, ID_TRAY_EXIT, "Exit");
         SetForegroundWindow(hwnd);
         TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
@@ -321,6 +399,9 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
           return 0;
         case ID_LOG_CLEAR:
           if (g_logEdit) SetWindowTextA(g_logEdit, "");
+          return 0;
+        case ID_TRAY_AUTOSTART:
+          SetAutoStart(!IsAutoStartEnabled());
           return 0;
         case ID_TRAY_EXIT:
           RequestExit();
@@ -349,7 +430,7 @@ void TrayThread() {
   WNDCLASSA wc = {};
   wc.lpfnWndProc = TrayWndProc;
   wc.hInstance = hInst;
-  wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+  wc.hIcon = LoadIconA(hInst, MAKEINTRESOURCEA(IDI_GHOST_ICON));
   wc.hCursor = LoadCursor(NULL, IDC_ARROW);
   wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
   wc.lpszClassName = cls;
@@ -369,7 +450,7 @@ void TrayThread() {
   g_trayIcon.uID = 1;
   g_trayIcon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
   g_trayIcon.uCallbackMessage = WM_TRAYICON;
-  g_trayIcon.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+  g_trayIcon.hIcon = LoadIconA(hInst, MAKEINTRESOURCEA(IDI_GHOST_ICON));
   strcpy_s(g_trayIcon.szTip, "Ghost Proxifier");
   Shell_NotifyIconA(NIM_ADD, &g_trayIcon);
 

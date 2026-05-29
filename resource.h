@@ -1,0 +1,3 @@
+﻿//{{NO_DEPENDENCIES}}
+#define IDI_GHOST_ICON  101
+#define IDM_AUTOSTART   2001

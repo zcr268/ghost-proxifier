@@ -1,0 +1,2 @@
+﻿#include "resource.h"
+IDI_GHOST_ICON ICON "ghost.ico"
