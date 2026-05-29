@@ -83,6 +83,7 @@ bool IsGuiBuild() {
 }
 
 void AppendLogToUi(const std::string &text);
+static void TrimLogLines();
 
 class UiLogStreamBuf : public std::streambuf {
  public:
@@ -310,7 +311,7 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         LoadLibraryA("riched20.dll");
         LoadLibraryA("riched32.dll");
         g_logEdit = CreateWindowExA(
-            WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, "",
+            WS_EX_CLIENTEDGE, "RICHEDIT50W", "",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_LEFT | ES_MULTILINE |
             ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
             0, 0, 0, 0, hwnd, NULL, GetModuleHandleA(NULL), NULL);
