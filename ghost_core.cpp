@@ -58,6 +58,14 @@ typedef int(WINAPI *WSASend_t)(
     LPDWORD lpNumberOfBytesSent, DWORD dwFlags,
     LPWSAOVERLAPPED lpOverlapped,
     LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine);
+typedef INT(PASCAL *WSASendMsg_t)(
+    SOCKET s, LPWSAMSG lpMsg, DWORD dwFlags, LPDWORD lpNumberOfBytesSent,
+    LPWSAOVERLAPPED lpOverlapped,
+    LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine);
+typedef INT(PASCAL *WSARecvMsg_t)(
+    SOCKET s, LPWSAMSG lpMsg, LPDWORD lpdwNumberOfBytesRecvd,
+    LPWSAOVERLAPPED lpOverlapped,
+    LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine);
 
 typedef INT(WSAAPI *getaddrinfo_t)(PCSTR, PCSTR, const ADDRINFOA*, PADDRINFOA*);
 typedef INT(WSAAPI *GetAddrInfoW_t)(PCWSTR, PCWSTR, const ADDRINFOW*, PADDRINFOW*);
@@ -76,6 +84,8 @@ WSASendTo_t real_WSASendTo = NULL;
 recvfrom_t real_recvfrom = NULL;
 WSARecvFrom_t real_WSARecvFrom = NULL;
 WSASend_t real_WSASend = NULL;
+WSASendMsg_t real_WSASendMsg = NULL;
+WSARecvMsg_t real_WSARecvMsg = NULL;
 
 getaddrinfo_t real_getaddrinfo = NULL;
 GetAddrInfoW_t real_GetAddrInfoW = NULL;
@@ -1198,6 +1208,10 @@ bool IsUdp53Target(const sockaddr *sa, int salen) {
   return false;
 }
 
+bool GuidEquals(const GUID &a, const GUID &b) {
+  return memcmp(&a, &b, sizeof(GUID)) == 0;
+}
+
 bool EncodeSocks5UdpPacket(const sockaddr *target, int targetLen, const char *payload, int payloadLen, std::vector<char> &out) {
   if (!target || payloadLen < 0) return false;
   out.clear();
@@ -1383,11 +1397,16 @@ int UdpProxySend(SOCKET appSocket, const char *buf, int len, int flags, const so
     return SOCKET_ERROR;
   }
   int n = real_sendto(st.udp, packet.data(), (int)packet.size(), flags, (sockaddr *)&st.relay_addr, st.relay_len);
-  if (n == SOCKET_ERROR) return SOCKET_ERROR;
   std::string targetIp; int targetPort = 0;
   std::string relayIp; int relayPort = 0;
   DescribeSockaddr((sockaddr *)&st.target_addr, st.target_len, targetIp, targetPort);
   DescribeSockaddr((sockaddr *)&st.relay_addr, st.relay_len, relayIp, relayPort);
+  if (n == SOCKET_ERROR) {
+    NetLog("[Proxy] UDP send failed: %s:%d via %s:%d payload=%d packet=%d err=%d",
+           targetIp.c_str(), targetPort, relayIp.c_str(), relayPort, len,
+           (int)packet.size(), WSAGetLastError());
+    return SOCKET_ERROR;
+  }
   NetLog("[Proxy] UDP send OK: %s:%d via %s:%d payload=%d packet=%d",
          targetIp.c_str(), targetPort, relayIp.c_str(), relayPort, len, n);
   return len;
@@ -2351,6 +2370,105 @@ int WINAPI hook_WSARecvFrom(
   return ret;
 }
 
+INT PASCAL hook_WSASendMsg(SOCKET s, LPWSAMSG lpMsg, DWORD dwFlags,
+                           LPDWORD lpNumberOfBytesSent,
+                           LPWSAOVERLAPPED lpOverlapped,
+                           LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
+  if (IsDnsRedirectUdpSocket(s)) {
+    return real_WSASendMsg
+               ? real_WSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent, lpOverlapped,
+                                 lpCompletionRoutine)
+               : SOCKET_ERROR;
+  }
+  if (IsDatagramSocket(s) && g_UdpMode != UdpMode::Direct) {
+    if (!lpMsg || lpMsg->dwBufferCount == 0 || !lpMsg->lpBuffers) {
+      NetLog("[Proxy] WSASendMsg UDP failed: empty message");
+      WSASetLastError(WSAEINVAL);
+      return SOCKET_ERROR;
+    }
+    if (lpOverlapped || lpCompletionRoutine) {
+      std::string ip; int port = 0;
+      if (lpMsg->name) DescribeSockaddr(lpMsg->name, lpMsg->namelen, ip, port);
+      NetLog("[Proxy] WSASendMsg UDP overlapped unsupported: %s:%d buffers=%lu",
+             ip.c_str(), port, (unsigned long)lpMsg->dwBufferCount);
+      WSASetLastError(WSAEOPNOTSUPP);
+      return SOCKET_ERROR;
+    }
+    DWORD total = 0;
+    for (DWORD i = 0; i < lpMsg->dwBufferCount; ++i) total += lpMsg->lpBuffers[i].len;
+    std::vector<char> merged(total);
+    DWORD off = 0;
+    for (DWORD i = 0; i < lpMsg->dwBufferCount; ++i) {
+      memcpy(merged.data() + off, lpMsg->lpBuffers[i].buf, lpMsg->lpBuffers[i].len);
+      off += lpMsg->lpBuffers[i].len;
+    }
+    int ret = UdpProxySend(s, merged.data(), (int)merged.size(), dwFlags,
+                           lpMsg->name, lpMsg->namelen);
+    if (ret != SOCKET_ERROR && lpNumberOfBytesSent) *lpNumberOfBytesSent = (DWORD)ret;
+    return ret == SOCKET_ERROR ? SOCKET_ERROR : 0;
+  }
+  return real_WSASendMsg
+             ? real_WSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent, lpOverlapped,
+                               lpCompletionRoutine)
+             : SOCKET_ERROR;
+}
+
+INT PASCAL hook_WSARecvMsg(SOCKET s, LPWSAMSG lpMsg,
+                           LPDWORD lpdwNumberOfBytesRecvd,
+                           LPWSAOVERLAPPED lpOverlapped,
+                           LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
+  if (!IsDnsRedirectUdpSocket(s) && IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+    if (!lpMsg || lpMsg->dwBufferCount == 0 || !lpMsg->lpBuffers) {
+      NetLog("[Proxy] WSARecvMsg UDP failed: empty message");
+      WSASetLastError(WSAEINVAL);
+      return SOCKET_ERROR;
+    }
+    if (lpOverlapped || lpCompletionRoutine) {
+      NetLog("[Proxy] WSARecvMsg UDP overlapped unsupported: buffers=%lu",
+             (unsigned long)lpMsg->dwBufferCount);
+      WSASetLastError(WSAEOPNOTSUPP);
+      return SOCKET_ERROR;
+    }
+    int fromLen = lpMsg->namelen;
+    int n = UdpProxyRecv(s, lpMsg->lpBuffers[0].buf, lpMsg->lpBuffers[0].len,
+                         lpMsg->dwFlags, lpMsg->name, lpMsg->name ? &fromLen : NULL);
+    if (n != SOCKET_ERROR) {
+      if (lpMsg->name) lpMsg->namelen = fromLen;
+      if (lpdwNumberOfBytesRecvd) *lpdwNumberOfBytesRecvd = (DWORD)n;
+    }
+    return n == SOCKET_ERROR ? SOCKET_ERROR : 0;
+  }
+  return real_WSARecvMsg
+             ? real_WSARecvMsg(s, lpMsg, lpdwNumberOfBytesRecvd, lpOverlapped,
+                               lpCompletionRoutine)
+             : SOCKET_ERROR;
+}
+
+int WINAPI hook_WSAIoctl(SOCKET s, DWORD dwIoControlCode, LPVOID lpvInBuffer,
+                         DWORD cbInBuffer, LPVOID lpvOutBuffer,
+                         DWORD cbOutBuffer, LPDWORD lpcbBytesReturned,
+                         LPWSAOVERLAPPED lpOverlapped,
+                         LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
+  int ret = real_WSAIoctl(s, dwIoControlCode, lpvInBuffer, cbInBuffer,
+                          lpvOutBuffer, cbOutBuffer, lpcbBytesReturned,
+                          lpOverlapped, lpCompletionRoutine);
+  if (ret == 0 && dwIoControlCode == SIO_GET_EXTENSION_FUNCTION_POINTER &&
+      lpvInBuffer && cbInBuffer >= sizeof(GUID) && lpvOutBuffer &&
+      cbOutBuffer >= sizeof(void *)) {
+    GUID requested = *(GUID *)lpvInBuffer;
+    if (GuidEquals(requested, WSAID_WSASENDMSG)) {
+      real_WSASendMsg = *(WSASendMsg_t *)lpvOutBuffer;
+      *(WSASendMsg_t *)lpvOutBuffer = hook_WSASendMsg;
+      NetLog("[Init] Hooked WSAID_WSASENDMSG extension pointer");
+    } else if (GuidEquals(requested, WSAID_WSARECVMSG)) {
+      real_WSARecvMsg = *(WSARecvMsg_t *)lpvOutBuffer;
+      *(WSARecvMsg_t *)lpvOutBuffer = hook_WSARecvMsg;
+      NetLog("[Init] Hooked WSAID_WSARECVMSG extension pointer");
+    }
+  }
+  return ret;
+}
+
 INT WSAAPI hook_getaddrinfo(PCSTR pNodeName, PCSTR pServiceName, const ADDRINFOA *pHints, PADDRINFOA *ppResult) {
     // If not a domain name (NULL or already an IP), pass through
     if (!pNodeName || IsIpLiteral(pNodeName)) {
@@ -2614,6 +2732,7 @@ DWORD WINAPI SetupThread(LPVOID lpParam) {
   real_WSASendTo = (WSASendTo_t)GetProcAddress(h, "WSASendTo");
   real_recvfrom = (recvfrom_t)GetProcAddress(h, "recvfrom");
   real_WSARecvFrom = (WSARecvFrom_t)GetProcAddress(h, "WSARecvFrom");
+  real_WSAIoctl = (WSAIoctl_t)GetProcAddress(h, "WSAIoctl");
   real_connect = (connect_t)GetProcAddress(h, "connect");
   MH_CreateHook((void *)real_connect, (void *)hook_connect,
                 (void **)&real_connect);
@@ -2634,8 +2753,9 @@ DWORD WINAPI SetupThread(LPVOID lpParam) {
   GUID g = WSAID_CONNECTEX;
   DWORD b = 0;
   ConnectEx_t pCE = NULL;
-  if (WSAIoctl(d, SIO_GET_EXTENSION_FUNCTION_POINTER, &g, sizeof(g), &pCE,
-               sizeof(pCE), &b, NULL, NULL) == 0) {
+  if (real_WSAIoctl &&
+      real_WSAIoctl(d, SIO_GET_EXTENSION_FUNCTION_POINTER, &g, sizeof(g), &pCE,
+                    sizeof(pCE), &b, NULL, NULL) == 0) {
     if (pCE)
       MH_CreateHook((void *)pCE, (void *)hook_ConnectEx,
                     (void **)&real_ConnectEx);
@@ -2661,6 +2781,9 @@ DWORD WINAPI SetupThread(LPVOID lpParam) {
   if (real_WSARecvFrom)
     MH_CreateHook((void *)real_WSARecvFrom, (void *)hook_WSARecvFrom,
                   (void **)&real_WSARecvFrom);
+  if (real_WSAIoctl)
+    MH_CreateHook((void *)real_WSAIoctl, (void *)hook_WSAIoctl,
+                  (void **)&real_WSAIoctl);
   if (g_DnsMode == DnsMode::Proxy)
     CreateThread(NULL, 0, DnsProxyThread, NULL, 0, NULL);
   MH_EnableHook(MH_ALL_HOOKS);
