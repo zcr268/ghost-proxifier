@@ -1836,6 +1836,7 @@ BOOL PASCAL hook_ConnectEx(SOCKET s, const struct sockaddr *name, int namelen,
     }
     if (IsDatagramSocket(s) && port == 53 && g_DnsMode == DnsMode::System) {
       NetLog("[DNS] ConnectEx UDP/53 direct: %s:%d | %s (dns=system)", ip, port, domain.c_str());
+      MarkDnsRedirectUdpSocket(s);
       return real_ConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength,
                             lpBytesSent, lpOverlapped);
     }
@@ -1922,6 +1923,7 @@ int WINAPI hook_WSAConnect(SOCKET s, const sockaddr *name, int namelen,
     }
     if (IsDatagramSocket(s) && port == 53 && g_DnsMode == DnsMode::System) {
       NetLog("[DNS] WSAConnect UDP/53 direct: %s:%d | %s (dns=system)", ip, port, domain.c_str());
+      MarkDnsRedirectUdpSocket(s);
       return real_WSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS,
                              lpGQOS);
     }
@@ -2012,6 +2014,7 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
     }
     if (IsDatagramSocket(s) && port == 53 && g_DnsMode == DnsMode::System) {
       NetLog("[DNS] connect UDP/53 direct: %s:%d | %s (dns=system)", ip, port, domain.c_str());
+      MarkDnsRedirectUdpSocket(s);
       return real_connect(s, name, namelen);
     }
     if (!IsStreamSocket(s)) {
@@ -2166,6 +2169,7 @@ int WINAPI hook_sendto(SOCKET s, const char *buf, int len, int flags,
     std::string ip; int port = 0;
     DescribeSockaddr(to, tolen, ip, port);
     NetLog("[DNS] sendto UDP/53 direct: %s:%d (dns=system, len=%d)", ip.c_str(), port, len);
+    MarkDnsRedirectUdpSocket(s);
     return real_sendto(s, buf, len, flags, to, tolen);
   }
   if (to && IsDatagramSocket(s) && g_UdpMode != UdpMode::Direct) {
@@ -2194,6 +2198,7 @@ int WINAPI hook_WSASendTo(
     std::string ip; int port = 0;
     DescribeSockaddr(lpTo, iTolen, ip, port);
     NetLog("[DNS] WSASendTo UDP/53 direct: %s:%d (dns=system)", ip.c_str(), port);
+    MarkDnsRedirectUdpSocket(s);
     return real_WSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent,
                           dwFlags, lpTo, iTolen, lpOverlapped,
                           lpCompletionRoutine);
