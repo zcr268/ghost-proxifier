@@ -21,7 +21,7 @@ log_max_mb=10
 dns=system
 dns_server=8.8.8.8:53
 # IPv6/AAAA is enabled by default.
-# Set dns_ipv6=off if your network has no working IPv6 and AAAA fallback is slow.
+# Set dns_ipv6=off if your network has no working IPv6 and AAAA/IPv6 connect fallback is slow.
 dns_ipv6=off
 
 # Direct connection rules: use normal LAN/VPN route instead of HTTP CONNECT/SOCKS5 proxy.

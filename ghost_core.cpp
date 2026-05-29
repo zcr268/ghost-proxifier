@@ -194,6 +194,7 @@ bool CompletePendingHandshake(SOCKET s) {
 }
 
 bool IsKnownDoHServer(const char* ip, int port) {
+    (void)port;
     if (strcmp(ip, "8.8.8.8") == 0) return true;
     if (strcmp(ip, "8.8.4.4") == 0) return true;
     if (strcmp(ip, "1.1.1.1") == 0) return true;
@@ -203,6 +204,16 @@ bool IsKnownDoHServer(const char* ip, int port) {
     if (strcmp(ip, "2606:4700:4700::1111") == 0) return true;
     if (strcmp(ip, "2606:4700:4700::1001") == 0) return true;
     return false;
+}
+
+bool ShouldFastFailIpv6Connect(int family, bool is_local) {
+    return family == AF_INET6 && !is_local && !g_DnsIpv6;
+}
+
+bool ShouldBlockDohConnect(int family, const char* ip, int port) {
+    if (!IsKnownDoHServer(ip, port)) return false;
+    if (g_DnsMode == DnsMode::Proxy) return true;
+    return family == AF_INET6 && !g_DnsIpv6;
 }
 
 // --- Helpers ---
@@ -1132,9 +1143,14 @@ BOOL PASCAL hook_ConnectEx(SOCKET s, const struct sockaddr *name, int namelen,
       if (strcmp(ip, "::1") == 0)
         is_local = true;
     }
-    if (g_DnsMode == DnsMode::Proxy && IsKnownDoHServer(ip, port)) {
+    if (ShouldBlockDohConnect(name->sa_family, ip, port)) {
       NetLog("[hook] Blocking DoH server %s:%d to force DNS fallback", ip, port);
       WSASetLastError(WSAECONNREFUSED);
+      return FALSE;
+    }
+    if (ShouldFastFailIpv6Connect(name->sa_family, is_local)) {
+      NetLog("[hook] Fast-fail IPv6 connect: %s:%d (dns_ipv6=off)", ip, port);
+      WSASetLastError(WSAEHOSTUNREACH);
       return FALSE;
     }
     if (!ShouldDirectConnect(ip, port, domain, name->sa_family, is_local)) {
@@ -1182,9 +1198,14 @@ int WINAPI hook_WSAConnect(SOCKET s, const sockaddr *name, int namelen,
       if (strcmp(ip, "::1") == 0)
         is_local = true;
     }
-    if (g_DnsMode == DnsMode::Proxy && IsKnownDoHServer(ip, port)) {
+    if (ShouldBlockDohConnect(name->sa_family, ip, port)) {
       NetLog("[hook] Blocking DoH server %s:%d to force DNS fallback", ip, port);
       WSASetLastError(WSAECONNREFUSED);
+      return SOCKET_ERROR;
+    }
+    if (ShouldFastFailIpv6Connect(name->sa_family, is_local)) {
+      NetLog("[hook] Fast-fail IPv6 connect: %s:%d (dns_ipv6=off)", ip, port);
+      WSASetLastError(WSAEHOSTUNREACH);
       return SOCKET_ERROR;
     }
     if (!ShouldDirectConnect(ip, port, domain, name->sa_family, is_local)) {
@@ -1235,9 +1256,14 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
       if (strcmp(ip, "::1") == 0)
         is_local = true;
     }
-    if (g_DnsMode == DnsMode::Proxy && IsKnownDoHServer(ip, port)) {
+    if (ShouldBlockDohConnect(name->sa_family, ip, port)) {
       NetLog("[hook] Blocking DoH server %s:%d to force DNS fallback", ip, port);
       WSASetLastError(WSAECONNREFUSED);
+      return SOCKET_ERROR;
+    }
+    if (ShouldFastFailIpv6Connect(name->sa_family, is_local)) {
+      NetLog("[hook] Fast-fail IPv6 connect: %s:%d (dns_ipv6=off)", ip, port);
+      WSASetLastError(WSAEHOSTUNREACH);
       return SOCKET_ERROR;
     }
     if (!ShouldDirectConnect(ip, port, domain, name->sa_family, is_local)) {
