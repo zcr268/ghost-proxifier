@@ -34,6 +34,7 @@ typedef int(WINAPI *WSAIoctl_t)(
     LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine);
 typedef int(WINAPI *send_t)(SOCKET s, const char *buf, int len, int flags);
 typedef int(WINAPI *recv_t)(SOCKET s, char *buf, int len, int flags);
+typedef int(WINAPI *closesocket_t)(SOCKET s);
 typedef int(WINAPI *WSARecv_t)(
     SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
     LPDWORD lpNumberOfBytesRecvd, LPDWORD lpFlags,
@@ -78,6 +79,7 @@ ConnectEx_t real_ConnectEx = NULL;
 WSAIoctl_t real_WSAIoctl = NULL;
 send_t real_send = NULL;
 recv_t real_recv = NULL;
+closesocket_t real_closesocket = NULL;
 WSARecv_t real_WSARecv = NULL;
 sendto_t real_sendto = NULL;
 WSASendTo_t real_WSASendTo = NULL;
@@ -180,6 +182,8 @@ std::unordered_map<SOCKET, UdpProxyState> g_UdpProxyStates;
 std::mutex g_UdpProxyMutex;
 std::unordered_map<SOCKET, bool> g_DnsRedirectUdpSockets;
 std::mutex g_DnsRedirectUdpMutex;
+std::unordered_map<SOCKET, bool> g_SystemDnsDirectUdpSockets;
+std::mutex g_SystemDnsDirectUdpMutex;
 
 // Complete deferred proxy handshake before the first socket I/O.
 bool CompletePendingHandshake(SOCKET s) {
@@ -277,6 +281,51 @@ void MarkDnsRedirectUdpSocket(SOCKET s) {
 bool IsDnsRedirectUdpSocket(SOCKET s) {
   std::lock_guard<std::mutex> lock(g_DnsRedirectUdpMutex);
   return g_DnsRedirectUdpSockets.find(s) != g_DnsRedirectUdpSockets.end();
+}
+
+void MarkSystemDnsDirectUdpSocket(SOCKET s) {
+  std::lock_guard<std::mutex> lock(g_SystemDnsDirectUdpMutex);
+  g_SystemDnsDirectUdpSockets[s] = true;
+}
+
+void ClearSystemDnsDirectUdpSocket(SOCKET s) {
+  std::lock_guard<std::mutex> lock(g_SystemDnsDirectUdpMutex);
+  g_SystemDnsDirectUdpSockets.erase(s);
+}
+
+bool IsSystemDnsDirectUdpSocket(SOCKET s) {
+  std::lock_guard<std::mutex> lock(g_SystemDnsDirectUdpMutex);
+  return g_SystemDnsDirectUdpSockets.find(s) != g_SystemDnsDirectUdpSockets.end();
+}
+
+bool ShouldBypassUdpProxySocket(SOCKET s) {
+  return IsDnsRedirectUdpSocket(s) || IsSystemDnsDirectUdpSocket(s);
+}
+
+void ClearUdpSocketTracking(SOCKET s) {
+  {
+    std::lock_guard<std::mutex> lock(g_DnsRedirectUdpMutex);
+    g_DnsRedirectUdpSockets.erase(s);
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_SystemDnsDirectUdpMutex);
+    g_SystemDnsDirectUdpSockets.erase(s);
+  }
+  UdpProxyState st;
+  bool hasUdpProxyState = false;
+  {
+    std::lock_guard<std::mutex> lock(g_UdpProxyMutex);
+    auto it = g_UdpProxyStates.find(s);
+    if (it != g_UdpProxyStates.end()) {
+      st = it->second;
+      g_UdpProxyStates.erase(it);
+      hasUdpProxyState = true;
+    }
+  }
+  if (hasUdpProxyState && real_closesocket) {
+    if (st.udp != INVALID_SOCKET) real_closesocket(st.udp);
+    if (st.control != INVALID_SOCKET) real_closesocket(st.control);
+  }
 }
 
 bool ShouldRejectUnsupportedUdpConnect(SOCKET s, const char *api, int family, const char *ip, int port, const std::string &domain) {
@@ -1855,12 +1904,13 @@ BOOL PASCAL hook_ConnectEx(SOCKET s, const struct sockaddr *name, int namelen,
     }
     if (IsDatagramSocket(s) && port == 53 && g_DnsMode == DnsMode::System) {
       NetLog("[DNS] ConnectEx UDP/53 direct: %s:%d | %s (dns=system)", ip, port, domain.c_str());
-      MarkDnsRedirectUdpSocket(s);
+      MarkSystemDnsDirectUdpSocket(s);
       return real_ConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength,
                             lpBytesSent, lpOverlapped);
     }
     if (!IsStreamSocket(s)) {
       if (IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+        ClearSystemDnsDirectUdpSocket(s);
         UdpProxyState st;
         if (EnsureUdpProxyState(s, name, namelen, st)) {
           NetLog("[hook] ConnectEx UDP proxy prepared: %s:%d | %s", ip, port, domain.c_str());
@@ -1942,12 +1992,13 @@ int WINAPI hook_WSAConnect(SOCKET s, const sockaddr *name, int namelen,
     }
     if (IsDatagramSocket(s) && port == 53 && g_DnsMode == DnsMode::System) {
       NetLog("[DNS] WSAConnect UDP/53 direct: %s:%d | %s (dns=system)", ip, port, domain.c_str());
-      MarkDnsRedirectUdpSocket(s);
+      MarkSystemDnsDirectUdpSocket(s);
       return real_WSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS,
                              lpGQOS);
     }
     if (!IsStreamSocket(s)) {
       if (IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+        ClearSystemDnsDirectUdpSocket(s);
         UdpProxyState st;
         if (EnsureUdpProxyState(s, name, namelen, st)) {
           NetLog("[hook] WSAConnect UDP proxy prepared: %s:%d | %s", ip, port, domain.c_str());
@@ -2033,11 +2084,12 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
     }
     if (IsDatagramSocket(s) && port == 53 && g_DnsMode == DnsMode::System) {
       NetLog("[DNS] connect UDP/53 direct: %s:%d | %s (dns=system)", ip, port, domain.c_str());
-      MarkDnsRedirectUdpSocket(s);
+      MarkSystemDnsDirectUdpSocket(s);
       return real_connect(s, name, namelen);
     }
     if (!IsStreamSocket(s)) {
       if (IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+        ClearSystemDnsDirectUdpSocket(s);
         UdpProxyState st;
         if (EnsureUdpProxyState(s, name, namelen, st)) {
           NetLog("[hook] connect UDP proxy prepared: %s:%d | %s", ip, port, domain.c_str());
@@ -2086,10 +2138,11 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
 
 // --- Lazy handshake send hooks ---
 int WINAPI hook_send(SOCKET s, const char *buf, int len, int flags) {
-  if (IsDnsRedirectUdpSocket(s)) {
+  if (ShouldBypassUdpProxySocket(s)) {
     return real_send(s, buf, len, flags);
   }
   if (IsDatagramSocket(s) && g_UdpMode != UdpMode::Direct) {
+    ClearSystemDnsDirectUdpSocket(s);
     return UdpProxySend(s, buf, len, flags, NULL, 0);
   }
   if (!CompletePendingHandshake(s)) {
@@ -2103,11 +2156,12 @@ int WINAPI hook_WSASend(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
                          LPDWORD lpNumberOfBytesSent, DWORD dwFlags,
                          LPWSAOVERLAPPED lpOverlapped,
                          LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
-  if (IsDnsRedirectUdpSocket(s)) {
+  if (ShouldBypassUdpProxySocket(s)) {
     return real_WSASend(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent,
                         dwFlags, lpOverlapped, lpCompletionRoutine);
   }
   if (IsDatagramSocket(s) && g_UdpMode != UdpMode::Direct) {
+    ClearSystemDnsDirectUdpSocket(s);
     if (lpOverlapped || lpCompletionRoutine || dwBufferCount == 0) {
       WSASetLastError(WSAEOPNOTSUPP);
       return SOCKET_ERROR;
@@ -2132,9 +2186,13 @@ int WINAPI hook_WSASend(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
                        dwFlags, lpOverlapped, lpCompletionRoutine);
 }
 
+int WINAPI hook_closesocket(SOCKET s) {
+  ClearUdpSocketTracking(s);
+  return real_closesocket ? real_closesocket(s) : SOCKET_ERROR;
+}
 
 int WINAPI hook_recv(SOCKET s, char *buf, int len, int flags) {
-  if (IsDnsRedirectUdpSocket(s)) {
+  if (ShouldBypassUdpProxySocket(s)) {
     return real_recv(s, buf, len, flags);
   }
   if (IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
@@ -2151,7 +2209,7 @@ int WINAPI hook_WSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
                         LPDWORD lpNumberOfBytesRecvd, LPDWORD lpFlags,
                         LPWSAOVERLAPPED lpOverlapped,
                         LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
-  if (IsDnsRedirectUdpSocket(s)) {
+  if (ShouldBypassUdpProxySocket(s)) {
     return real_WSARecv(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags,
                         lpOverlapped, lpCompletionRoutine);
   }
@@ -2188,10 +2246,11 @@ int WINAPI hook_sendto(SOCKET s, const char *buf, int len, int flags,
     std::string ip; int port = 0;
     DescribeSockaddr(to, tolen, ip, port);
     NetLog("[DNS] sendto UDP/53 direct: %s:%d (dns=system, len=%d)", ip.c_str(), port, len);
-    MarkDnsRedirectUdpSocket(s);
+    MarkSystemDnsDirectUdpSocket(s);
     return real_sendto(s, buf, len, flags, to, tolen);
   }
   if (to && IsDatagramSocket(s) && g_UdpMode != UdpMode::Direct) {
+    ClearSystemDnsDirectUdpSocket(s);
     return UdpProxySend(s, buf, len, flags, to, tolen);
   }
   return real_sendto(s, buf, len, flags, to, tolen);
@@ -2217,12 +2276,13 @@ int WINAPI hook_WSASendTo(
     std::string ip; int port = 0;
     DescribeSockaddr(lpTo, iTolen, ip, port);
     NetLog("[DNS] WSASendTo UDP/53 direct: %s:%d (dns=system)", ip.c_str(), port);
-    MarkDnsRedirectUdpSocket(s);
+    MarkSystemDnsDirectUdpSocket(s);
     return real_WSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent,
                           dwFlags, lpTo, iTolen, lpOverlapped,
                           lpCompletionRoutine);
   }
   if (lpTo && IsDatagramSocket(s) && g_UdpMode != UdpMode::Direct) {
+    ClearSystemDnsDirectUdpSocket(s);
     if (lpOverlapped || lpCompletionRoutine || dwBufferCount == 0) {
       WSASetLastError(WSAEOPNOTSUPP);
       return SOCKET_ERROR;
@@ -2246,7 +2306,7 @@ int WINAPI hook_WSASendTo(
 
 int WINAPI hook_recvfrom(SOCKET s, char *buf, int len, int flags,
                          struct sockaddr *from, int *fromlen) {
-  if (!IsDnsRedirectUdpSocket(s) && IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+  if (!ShouldBypassUdpProxySocket(s) && IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
     return UdpProxyRecv(s, buf, len, flags, from, fromlen);
   }
   int ret = real_recvfrom(s, buf, len, flags, from, fromlen);
@@ -2305,7 +2365,7 @@ int WINAPI hook_WSARecvFrom(
     LPDWORD lpNumberOfBytesRecvd, LPDWORD lpFlags, struct sockaddr *lpFrom,
     LPINT lpFromlen, LPWSAOVERLAPPED lpOverlapped,
     LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
-  if (!IsDnsRedirectUdpSocket(s) && IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+  if (!ShouldBypassUdpProxySocket(s) && IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
     if (lpOverlapped || lpCompletionRoutine || dwBufferCount == 0) {
       WSASetLastError(WSAEOPNOTSUPP);
       return SOCKET_ERROR;
@@ -2374,13 +2434,28 @@ INT PASCAL hook_WSASendMsg(SOCKET s, LPWSAMSG lpMsg, DWORD dwFlags,
                            LPDWORD lpNumberOfBytesSent,
                            LPWSAOVERLAPPED lpOverlapped,
                            LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
-  if (IsDnsRedirectUdpSocket(s)) {
+  if (lpMsg && lpMsg->name && IsDatagramSocket(s) &&
+      g_DnsMode == DnsMode::System && IsUdp53Target(lpMsg->name, lpMsg->namelen)) {
+    std::string ip; int port = 0;
+    DescribeSockaddr(lpMsg->name, lpMsg->namelen, ip, port);
+    NetLog("[DNS] WSASendMsg UDP/53 direct: %s:%d (dns=system)", ip.c_str(), port);
+    MarkSystemDnsDirectUdpSocket(s);
+    return real_WSASendMsg
+               ? real_WSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent, lpOverlapped,
+                                 lpCompletionRoutine)
+               : SOCKET_ERROR;
+  }
+  if (lpMsg && lpMsg->name && IsDatagramSocket(s)) {
+    ClearSystemDnsDirectUdpSocket(s);
+  }
+  if (ShouldBypassUdpProxySocket(s)) {
     return real_WSASendMsg
                ? real_WSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent, lpOverlapped,
                                  lpCompletionRoutine)
                : SOCKET_ERROR;
   }
   if (IsDatagramSocket(s) && g_UdpMode != UdpMode::Direct) {
+    ClearSystemDnsDirectUdpSocket(s);
     if (!lpMsg || lpMsg->dwBufferCount == 0 || !lpMsg->lpBuffers) {
       NetLog("[Proxy] WSASendMsg UDP failed: empty message");
       WSASetLastError(WSAEINVAL);
@@ -2417,7 +2492,7 @@ INT PASCAL hook_WSARecvMsg(SOCKET s, LPWSAMSG lpMsg,
                            LPDWORD lpdwNumberOfBytesRecvd,
                            LPWSAOVERLAPPED lpOverlapped,
                            LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
-  if (!IsDnsRedirectUdpSocket(s) && IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
+  if (!ShouldBypassUdpProxySocket(s) && IsDatagramSocket(s) && g_UdpMode == UdpMode::Proxy) {
     if (!lpMsg || lpMsg->dwBufferCount == 0 || !lpMsg->lpBuffers) {
       NetLog("[Proxy] WSARecvMsg UDP failed: empty message");
       WSASetLastError(WSAEINVAL);
@@ -2728,6 +2803,7 @@ DWORD WINAPI SetupThread(LPVOID lpParam) {
   HMODULE h = GetModuleHandleA("ws2_32.dll");
   real_send = (send_t)GetProcAddress(h, "send");
   real_recv = (recv_t)GetProcAddress(h, "recv");
+  real_closesocket = (closesocket_t)GetProcAddress(h, "closesocket");
   real_sendto = (sendto_t)GetProcAddress(h, "sendto");
   real_WSASendTo = (WSASendTo_t)GetProcAddress(h, "WSASendTo");
   real_recvfrom = (recvfrom_t)GetProcAddress(h, "recvfrom");
@@ -2781,6 +2857,9 @@ DWORD WINAPI SetupThread(LPVOID lpParam) {
   if (real_WSARecvFrom)
     MH_CreateHook((void *)real_WSARecvFrom, (void *)hook_WSARecvFrom,
                   (void **)&real_WSARecvFrom);
+  if (real_closesocket)
+    MH_CreateHook((void *)real_closesocket, (void *)hook_closesocket,
+                  (void **)&real_closesocket);
   if (real_WSAIoctl)
     MH_CreateHook((void *)real_WSAIoctl, (void *)hook_WSAIoctl,
                   (void **)&real_WSAIoctl);
@@ -2820,14 +2899,18 @@ DWORD WINAPI CleanupThread(LPVOID lpParam) {
   {
     std::lock_guard<std::mutex> lock(g_UdpProxyMutex);
     for (auto &kv : g_UdpProxyStates) {
-      if (kv.second.udp != INVALID_SOCKET) closesocket(kv.second.udp);
-      if (kv.second.control != INVALID_SOCKET) closesocket(kv.second.control);
+      if (kv.second.udp != INVALID_SOCKET && real_closesocket) real_closesocket(kv.second.udp);
+      if (kv.second.control != INVALID_SOCKET && real_closesocket) real_closesocket(kv.second.control);
     }
     g_UdpProxyStates.clear();
   }
   {
     std::lock_guard<std::mutex> lock(g_DnsRedirectUdpMutex);
     g_DnsRedirectUdpSockets.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_SystemDnsDirectUdpMutex);
+    g_SystemDnsDirectUdpSockets.clear();
   }
   if (g_LogSocket != INVALID_SOCKET) {
     closesocket(g_LogSocket);
