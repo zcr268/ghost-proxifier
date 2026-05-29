@@ -15,6 +15,9 @@ process=Codex.exe
 # When ghost-proxifier.log exceeds this size it is moved to ghost-proxifier.log.1
 # and a new log file is started.
 log_max_mb=10
+# GUI mode: start silently in the system tray instead of opening the log window.
+# Double-click the tray icon or right-click -> Open Logs to show it.
+start_minimized_to_tray=off
 # DNS handling:
 # dns=proxy forwards DNS queries through the configured upstream proxy to dns_server.
 # dns=system disables Ghost's DNS proxy and uses the process/system DNS directly.
@@ -23,8 +26,8 @@ dns_server=8.8.8.8:53
 # IPv6/AAAA is enabled by default.
 # Set dns_ipv6=off if your network has no working IPv6 and AAAA fallback is slow.
 dns_ipv6=on
-# IPv6 TCP connect handling: direct=let system handle it, fail=fast fail, proxy=try upstream proxy.
-ipv6_connect=direct
+# IPv6 TCP connect handling: proxy=forward via upstream proxy, direct=let system handle it, fail=fast fail.
+ipv6_connect=proxy
 
 # Direct connection rules: use normal LAN/VPN route instead of HTTP CONNECT/SOCKS5 proxy.
 # Local loopback is direct by default so the app can still talk to local services.

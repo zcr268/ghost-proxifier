@@ -36,6 +36,7 @@ static HWND g_trayWnd = NULL;
 static HWND g_logEdit = NULL;
 static NOTIFYICONDATAA g_trayIcon = {};
 static bool g_trayEnabled = true;
+static bool g_startMinimizedToTray = false;
 static std::atomic<bool> g_exitRequested{false};
 static WNDPROC g_originalConsoleWndProc = NULL;
 static std::mutex g_pendingLogMutex;
@@ -502,7 +503,9 @@ void TrayThread() {
   strcpy_s(g_trayIcon.szTip, "Ghost Proxifier");
   Shell_NotifyIconA(NIM_ADD, &g_trayIcon);
 
-  if (IsGuiBuild()) ShowWindow(g_trayWnd, SW_SHOW);
+  if (IsGuiBuild() && !g_startMinimizedToTray) {
+    ShowWindow(g_trayWnd, SW_SHOW);
+  }
 
   MSG m;
   while (GetMessageA(&m, NULL, 0, 0) > 0) {
@@ -529,7 +532,9 @@ void PrintHelp() {
       << "  -u <addr:port>   Set upstream proxy. Supports http://addr:port and socks5://addr:port."
       << std::endl;
   std::cout << "  -c <file>        Read config file (default: ghost.conf)." << std::endl;
-  std::cout << "                   Config can define process=, proxy=/socks5=, direct_domain=, direct_ip=." << std::endl;
+  std::cout << "                   Config can define process=, proxy=/socks5=, ipv6_connect=,"
+            << std::endl;
+  std::cout << "                   direct_domain=, direct_ip=, start_minimized_to_tray=." << std::endl;
   std::cout << "  --watch          Keep scanning and inject into new matching processes."
             << std::endl;
   std::cout << "  --no-tray        Disable system tray icon/minimize-to-tray behavior."
@@ -775,6 +780,13 @@ std::string ToLower(std::string s) {
   return s;
 }
 
+bool ParseBool(const std::string &value, bool defaultValue) {
+  std::string v = ToLower(Trim(value));
+  if (v == "1" || v == "true" || v == "yes" || v == "on" || v == "enable" || v == "enabled") return true;
+  if (v == "0" || v == "false" || v == "no" || v == "off" || v == "disable" || v == "disabled") return false;
+  return defaultValue;
+}
+
 void NormalizeAndAddTarget(std::vector<std::string> &targets, std::string target) {
   target = Trim(target);
   if (target.empty()) return;
@@ -846,6 +858,10 @@ void LoadInjectorLogConfig(const std::string &configPath) {
         g_logMaxBytes = (uint64_t)(std::stod(value) * 1024.0);
       } else if (key == "log_max_mb" || key == "log_file_max_mb") {
         g_logMaxBytes = (uint64_t)(std::stod(value) * 1024.0 * 1024.0);
+      } else if (key == "start_minimized" || key == "start_to_tray" ||
+                 key == "start_minimized_to_tray" || key == "silent_start" ||
+                 key == "startup_silent") {
+        g_startMinimizedToTray = ParseBool(value, g_startMinimizedToTray);
       }
     } catch (...) {
       // Keep previous/default limit on malformed values.
@@ -1046,7 +1062,8 @@ int AppMain(int argc, char *argv[]) {
             << " Config: " << configReadPath
             << " RuntimeConfig: " << runtimeConfigPath
             << " Watch: " << (watchMode ? "ON" : "OFF")
-            << " Tray: " << (g_trayEnabled ? "ON" : "OFF") << std::endl;
+            << " Tray: " << (g_trayEnabled ? "ON" : "OFF")
+            << " StartMinimized: " << (g_startMinimizedToTray ? "ON" : "OFF") << std::endl;
   if (defaultDoubleClickMode) {
     std::cout << "[Injector] Double-click mode: loaded ghost.conf and enabled --watch automatically." << std::endl;
   }

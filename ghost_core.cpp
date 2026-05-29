@@ -88,7 +88,7 @@ ProxyType g_ProxyType = ProxyType::Http;
 enum class DnsMode { Proxy, System };
 DnsMode g_DnsMode = DnsMode::Proxy;
 enum class Ipv6ConnectMode { Direct, Fail, Proxy };
-Ipv6ConnectMode g_Ipv6ConnectMode = Ipv6ConnectMode::Direct;
+Ipv6ConnectMode g_Ipv6ConnectMode = Ipv6ConnectMode::Proxy;
 bool g_DnsIpv6 = true;
 std::string g_DnsServerIP = "8.8.8.8";
 int g_DnsServerPort = 53;
@@ -129,6 +129,7 @@ bool GetDomainByRealIp(DWORD net_ip, std::string& domain) {
 
 void NetLog(const char *format, ...);
 bool PerformProxyConnect(SOCKET s, const char *ip_str, int port, int family, const std::string& domain = "");
+bool BuildProxySockaddrForSocket(SOCKET s, int socket_family, sockaddr_storage &proxy_addr, int &proxy_len);
 
 // --- Pending Proxy (Lazy Handshake) ---
 struct PendingProxy {
@@ -557,6 +558,61 @@ bool ShouldDirectConnect(const char *ip, int port, const std::string &domain, in
     if (inet_pton(AF_INET, ip, &addr) == 1 && IsDirectIp(addr.s_addr)) return true;
   }
   return false;
+}
+
+bool BuildProxySockaddrForSocket(SOCKET s, int socket_family, sockaddr_storage &proxy_addr, int &proxy_len) {
+  memset(&proxy_addr, 0, sizeof(proxy_addr));
+  proxy_len = 0;
+
+  in_addr a4;
+  in6_addr a6;
+  bool proxyIsV4 = inet_pton(AF_INET, g_ProxyIP.c_str(), &a4) == 1;
+  bool proxyIsV6 = inet_pton(AF_INET6, g_ProxyIP.c_str(), &a6) == 1;
+
+  if (socket_family == AF_INET) {
+    if (!proxyIsV4) {
+      NetLog("[Proxy] Cannot redirect IPv4 socket to non-IPv4 proxy address: %s", g_ProxyIP.c_str());
+      return false;
+    }
+    sockaddr_in *p = (sockaddr_in *)&proxy_addr;
+    p->sin_family = AF_INET;
+    p->sin_addr = a4;
+    p->sin_port = htons(g_ProxyPort);
+    proxy_len = sizeof(sockaddr_in);
+    return true;
+  }
+
+  if (socket_family == AF_INET6) {
+    sockaddr_in6 *p6 = (sockaddr_in6 *)&proxy_addr;
+    p6->sin6_family = AF_INET6;
+    p6->sin6_port = htons(g_ProxyPort);
+    if (proxyIsV6) {
+      p6->sin6_addr = a6;
+    } else if (proxyIsV4) {
+      // AF_INET6 sockets cannot connect to a sockaddr_in.  Use an IPv4-mapped
+      // IPv6 loopback/proxy address and explicitly allow dual-stack sockets.
+      DWORD off = 0;
+      setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&off, sizeof(off));
+      memset(&p6->sin6_addr, 0, sizeof(p6->sin6_addr));
+      p6->sin6_addr.s6_addr[10] = 0xff;
+      p6->sin6_addr.s6_addr[11] = 0xff;
+      memcpy(&p6->sin6_addr.s6_addr[12], &a4, 4);
+    } else {
+      NetLog("[Proxy] Cannot parse proxy address for IPv6 socket redirect: %s", g_ProxyIP.c_str());
+      return false;
+    }
+    proxy_len = sizeof(sockaddr_in6);
+    return true;
+  }
+
+  return false;
+}
+
+void LogDirectConnectIfUseful(const char *api, const char *ip, int port, const std::string &domain, int family, bool is_local) {
+  if (family == AF_INET6 && !is_local && g_Ipv6ConnectMode == Ipv6ConnectMode::Direct) {
+    NetLog("[hook] %s direct IPv6: %s:%d | %s (ipv6_connect=direct)",
+           api, ip, port, domain.c_str());
+  }
 }
 
 std::string GetDnsName(const char *buf, int &offset, int total_len) {
@@ -1177,11 +1233,15 @@ BOOL PASCAL hook_ConnectEx(SOCKET s, const struct sockaddr *name, int namelen,
         g_PendingProxySockets[s] = std::move(pp);
       }
       // Redirect ConnectEx to proxy, suppress initial data (will be sent after handshake)
-      sockaddr_in p;
-      p.sin_family = AF_INET;
-      p.sin_addr.s_addr = inet_addr(g_ProxyIP.c_str());
-      p.sin_port = htons(g_ProxyPort);
-      return real_ConnectEx(s, (const sockaddr *)&p, sizeof(p), NULL, 0, lpBytesSent, lpOverlapped);
+      sockaddr_storage p;
+      int pLen = 0;
+      if (!BuildProxySockaddrForSocket(s, name->sa_family, p, pLen)) {
+        WSASetLastError(WSAEADDRNOTAVAIL);
+        return FALSE;
+      }
+      return real_ConnectEx(s, (const sockaddr *)&p, pLen, NULL, 0, lpBytesSent, lpOverlapped);
+    } else {
+      LogDirectConnectIfUseful("ConnectEx", ip, port, domain, name->sa_family, is_local);
     }
   }
   return real_ConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength,
@@ -1228,11 +1288,15 @@ int WINAPI hook_WSAConnect(SOCKET s, const sockaddr *name, int namelen,
         g_PendingProxySockets[s] = {ip, port, name->sa_family, domain, {}};
       }
       // Redirect connect to proxy (keep original socket blocking mode)
-      sockaddr_in p;
-      p.sin_family = AF_INET;
-      p.sin_addr.s_addr = inet_addr(g_ProxyIP.c_str());
-      p.sin_port = htons(g_ProxyPort);
-      return real_connect(s, (const sockaddr *)&p, sizeof(p));
+      sockaddr_storage p;
+      int pLen = 0;
+      if (!BuildProxySockaddrForSocket(s, name->sa_family, p, pLen)) {
+        WSASetLastError(WSAEADDRNOTAVAIL);
+        return SOCKET_ERROR;
+      }
+      return real_WSAConnect(s, (const sockaddr *)&p, pLen, NULL, NULL, lpSQOS, lpGQOS);
+    } else {
+      LogDirectConnectIfUseful("WSAConnect", ip, port, domain, name->sa_family, is_local);
     }
   }
   return real_WSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS,
@@ -1286,11 +1350,15 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
         g_PendingProxySockets[s] = {ip, port, name->sa_family, domain, {}};
       }
       // Redirect connect to proxy (keep original socket blocking mode)
-      sockaddr_in p;
-      p.sin_family = AF_INET;
-      p.sin_addr.s_addr = inet_addr(g_ProxyIP.c_str());
-      p.sin_port = htons(g_ProxyPort);
-      return real_connect(s, (const sockaddr *)&p, sizeof(p));
+      sockaddr_storage p;
+      int pLen = 0;
+      if (!BuildProxySockaddrForSocket(s, name->sa_family, p, pLen)) {
+        WSASetLastError(WSAEADDRNOTAVAIL);
+        return SOCKET_ERROR;
+      }
+      return real_connect(s, (const sockaddr *)&p, pLen);
+    } else {
+      LogDirectConnectIfUseful("connect", ip, port, domain, name->sa_family, is_local);
     }
   }
   return real_connect(s, name, namelen);

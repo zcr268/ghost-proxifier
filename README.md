@@ -367,6 +367,8 @@ Rules:
 - `direct_domain=` / `bypass_domain=` matches the exact domain and all subdomains. `*.example.com`, `.example.com`, and `example.com` are treated as the same suffix rule.
 - `direct_ip=` / `bypass_ip=` supports IPv4 or CIDR, for example `192.168.1.25` or `192.168.0.0/16`.
 - `direct=` / `bypass=` accepts a comma-separated mixed list, for example `direct=*.local,10.0.0.0/8,192.168.1.2`.
+- `ipv6_connect=proxy` forwards IPv6 TCP connects through the upstream proxy. `direct` lets the system handle IPv6 directly and logs direct IPv6 connects; `fail` fast-fails non-local IPv6 connects.
+- `start_minimized_to_tray=on` starts the GUI build silently in the system tray without opening the log window. Double-click the tray icon or right-click -> `Open Logs` to restore it.
 - The old single-line format is still accepted as HTTP CONNECT: `127.0.0.1:2080`.
 
 SOCKS5 handshakes are now completed before the first `send`, `WSASend`, `recv`, or `WSARecv`. This matters for clients that use `ConnectEx` with initial data and then wait for a response; those connections should now appear in the upstream SOCKS5 proxy log as soon as the first socket I/O happens. If the target app only connects to `127.0.0.1`/LAN addresses covered by `direct_ip`, those connections are intentionally direct and will not appear in the SOCKS5 proxy log.
@@ -380,6 +382,7 @@ Domains in direct rules use system DNS and direct sockets, so they can go throug
 - Put `ghost-proxifier.exe`, `ghost_core.dll`, and `ghost.conf` in the same directory, then double-click `ghost-proxifier.exe` to start.
 - When started with no arguments, it automatically reads `ghost.conf` and enables `--watch`.
 - A `Ghost Proxifier` icon is added to the Windows system tray.
+- Set `start_minimized_to_tray=on` in `ghost.conf` if you want the GUI build to start silently in the tray.
 - Minimize the console window to hide it to the tray; double-click the tray icon to restore it.
 - Right-click the tray icon to choose `Open` or `Exit`.
 - Use `--no-tray` to disable the tray icon/minimize-to-tray behavior.
@@ -389,7 +392,7 @@ Domains in direct rules use system DNS and direct sockets, so they can go throug
 - `dns=proxy` (default) forwards DNS through the configured upstream proxy to `dns_server`.
 - `dns=system` disables Ghost's DNS proxy and uses the normal system/process DNS path.
 - `dns_server=8.8.8.8:53` selects the DNS server used by `dns=proxy`.
-- `dns_ipv6=off` is the default; AAAA/IPv6 DNS queries return quickly with an empty answer and AF_UNSPEC lookups are forced to IPv4 to avoid slow IPv6 failures. Use `dns_ipv6=on` if IPv6 is required.
+- `dns_ipv6=on` enables AAAA/IPv6 DNS results. `ipv6_connect=proxy` sends IPv6 TCP connects through the upstream SOCKS5/HTTP CONNECT proxy; `ipv6_connect=direct` uses the system route and logs the direct IPv6 connect; `ipv6_connect=fail` returns quickly for non-local IPv6.
 - Clicking the console close button is intercepted as minimize-to-tray when Windows allows it; if Windows refuses console subclassing, the close command is disabled so the process cannot be killed without restoring hooks. Use minimize or the tray icon instead.
 - Use the tray icon right-click menu `Exit` to quit; every normal exit path unloads `ghost_core.dll` from injected processes so they stop using the proxy.
 - `ghost-proxifier.exe --unload` can be used to restore already-injected processes manually.
