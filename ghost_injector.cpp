@@ -20,6 +20,7 @@
 #include <mutex>
 #include <deque>
 #include <streambuf>
+#include <cstdint>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -40,6 +41,9 @@ static WNDPROC g_originalConsoleWndProc = NULL;
 static std::mutex g_pendingLogMutex;
 static std::deque<std::string> g_pendingLogs;
 static std::ofstream g_logFile;
+static std::string g_logPath;
+static uint64_t g_logMaxBytes = 10ULL * 1024ULL * 1024ULL;
+static uint64_t g_logBytesWritten = 0;
 static std::streambuf *g_oldCoutBuf = nullptr;
 static std::streambuf *g_oldCerrBuf = nullptr;
 
@@ -118,11 +122,45 @@ void ShowMainWindow();
 
 std::string GetExeDir();
 
+static uint64_t GetFileSizeBytes(const std::string &path) {
+  WIN32_FILE_ATTRIBUTE_DATA data;
+  if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) return 0;
+  ULARGE_INTEGER size;
+  size.HighPart = data.nFileSizeHigh;
+  size.LowPart = data.nFileSizeLow;
+  return size.QuadPart;
+}
+
+static void RotateLogFileIfNeeded(uint64_t incomingBytes) {
+  if (g_logPath.empty() || g_logMaxBytes == 0) return;
+  if (g_logBytesWritten + incomingBytes <= g_logMaxBytes) return;
+  if (g_logFile.is_open()) g_logFile.close();
+  std::string backup = g_logPath + ".1";
+  DeleteFileA(backup.c_str());
+  MoveFileExA(g_logPath.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+  g_logFile.open(g_logPath, std::ios::out | std::ios::binary | std::ios::trunc);
+  g_logBytesWritten = 0;
+  if (g_logFile.is_open()) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    g_logFile << "===== Ghost Proxifier log rotated "
+              << st.wYear << "-" << st.wMonth << "-" << st.wDay << " "
+              << st.wHour << ":" << st.wMinute << ":" << st.wSecond
+              << " (max " << g_logMaxBytes << " bytes) =====\r\n";
+    g_logFile.flush();
+    g_logBytesWritten = GetFileSizeBytes(g_logPath);
+  }
+}
+
 void AppendLogToUi(const std::string &text) {
   if (text.empty()) return;
   if (g_logFile.is_open()) {
-    g_logFile << text;
-    g_logFile.flush();
+    RotateLogFileIfNeeded(static_cast<uint64_t>(text.size()));
+    if (g_logFile.is_open()) {
+      g_logFile << text;
+      g_logFile.flush();
+      g_logBytesWritten += static_cast<uint64_t>(text.size());
+    }
   }
   if (!IsGuiBuild()) return;
   std::string *copy = new std::string(text);
@@ -174,15 +212,24 @@ void AppendLogTextToEdit(const std::string &text) {
 
 void InstallUiLogCapture() {
   if (!IsGuiBuild() || g_uiCoutBuf) return;
-  std::string logPath = GetExeDir() + "\\ghost-proxifier.log";
-  g_logFile.open(logPath, std::ios::app | std::ios::binary);
+  g_logPath = GetExeDir() + "\\ghost-proxifier.log";
+  g_logBytesWritten = GetFileSizeBytes(g_logPath);
+  if (g_logMaxBytes > 0 && g_logBytesWritten > g_logMaxBytes) {
+    std::string backup = g_logPath + ".1";
+    DeleteFileA(backup.c_str());
+    MoveFileExA(g_logPath.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+    g_logBytesWritten = 0;
+  }
+  g_logFile.open(g_logPath, std::ios::app | std::ios::binary);
   if (g_logFile.is_open()) {
     SYSTEMTIME st;
     GetLocalTime(&st);
     g_logFile << "\r\n===== Ghost Proxifier started "
               << st.wYear << "-" << st.wMonth << "-" << st.wDay << " "
               << st.wHour << ":" << st.wMinute << ":" << st.wSecond
-              << " =====\r\n";
+              << " (log_max_bytes=" << g_logMaxBytes << ") =====\r\n";
+    g_logFile.flush();
+    g_logBytesWritten = GetFileSizeBytes(g_logPath);
   }
   g_oldCoutBuf = std::cout.rdbuf();
   g_oldCerrBuf = std::cerr.rdbuf();
@@ -779,6 +826,33 @@ void LoadInjectorConfigTargets(const std::string &configPath, std::vector<std::s
   }
 }
 
+void LoadInjectorLogConfig(const std::string &configPath) {
+  std::ifstream f(configPath);
+  if (!f.is_open()) return;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    std::string t = Trim(line);
+    if (t.empty() || t[0] == '#' || t[0] == ';' || (t.front() == '[' && t.back() == ']')) continue;
+    size_t eq = t.find('=');
+    if (eq == std::string::npos) continue;
+    std::string key = ToLower(Trim(t.substr(0, eq)));
+    std::string value = Trim(t.substr(eq + 1));
+    if (value.empty()) continue;
+    try {
+      if (key == "log_max_bytes" || key == "log_file_max_bytes") {
+        g_logMaxBytes = (uint64_t)std::stoull(value);
+      } else if (key == "log_max_kb" || key == "log_file_max_kb") {
+        g_logMaxBytes = (uint64_t)(std::stod(value) * 1024.0);
+      } else if (key == "log_max_mb" || key == "log_file_max_mb") {
+        g_logMaxBytes = (uint64_t)(std::stod(value) * 1024.0 * 1024.0);
+      }
+    } catch (...) {
+      // Keep previous/default limit on malformed values.
+    }
+  }
+}
+
 bool CopyTextFile(const std::string &src, const std::string &dst) {
   std::ifstream in(src, std::ios::binary);
   if (!in.is_open()) return false;
@@ -822,7 +896,6 @@ int AppMain(int argc, char *argv[]) {
   AttachConsoleForCliIfNeeded(argc);
   SetConsoleOutputCP(CP_UTF8);
   SetConsoleCP(CP_UTF8);
-  InstallUiLogCapture();
 
   std::vector<DWORD> injectedPids;
 
@@ -874,16 +947,19 @@ int AppMain(int argc, char *argv[]) {
     watchMode = true;
   }
 
-  if (g_trayEnabled && !statusMode) {
-    std::thread(TrayThread).detach();
-    InstallConsoleCloseToTrayHook();
-  }
-
   std::string exeDir = GetExeDir();
   std::string runtimeConfigPath = exeDir + "\\ghost.conf";
   std::string configReadPath = configPath;
   if (!configFromCli && !FileExists(configReadPath) && FileExists(runtimeConfigPath)) {
     configReadPath = runtimeConfigPath;
+  }
+
+  LoadInjectorLogConfig(configReadPath);
+  InstallUiLogCapture();
+
+  if (g_trayEnabled && !statusMode) {
+    std::thread(TrayThread).detach();
+    InstallConsoleCloseToTrayHook();
   }
 
   LoadInjectorConfigTargets(configReadPath, targets, upstream);

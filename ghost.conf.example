@@ -11,22 +11,33 @@ proxy=socks5://127.0.0.1:7890
 # proxy=127.0.0.1:1080
 process=Codex.exe
 
+# Log file auto-cleanup for GUI mode. 0 disables rotation.
+# When ghost-proxifier.log exceeds this size it is moved to ghost-proxifier.log.1
+# and a new log file is started.
+log_max_mb=10
 # DNS handling:
 # dns=proxy forwards DNS queries through the configured upstream proxy to dns_server.
 # dns=system disables Ghost's DNS proxy and uses the process/system DNS directly.
-dns=proxy
+dns=system
 dns_server=8.8.8.8:53
 # IPv6/AAAA is enabled by default.
 # Set dns_ipv6=off if your network has no working IPv6 and AAAA fallback is slow.
-dns_ipv6=on
+dns_ipv6=off
 
 # Direct connection rules: use normal LAN/VPN route instead of HTTP CONNECT/SOCKS5 proxy.
 # Local loopback is direct by default so the app can still talk to local services.
+direct_domain=local
+direct_domain=localhost
+direct_domain=cli-proxy-api-latest-e774.onrender.com
+direct_domain=*.github.com
+direct_domain=github.com
+
 direct_ip=127.0.0.1
 # direct_domain=*.corp.example.com
 # direct_domain=intranet.local
 # direct_ip=172.16.0.0/12
 direct_ip=192.168.0.0/16
+direct_ip=198.18.0.1/16
 
 # Optional per-process override.
 # [process:Code.exe]
