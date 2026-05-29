@@ -665,10 +665,19 @@ bool ConnectSocketToUpstreamProxy(SOCKET s) {
 
 bool RelayPumpOnce(SOCKET from, SOCKET to, char *buf, int bufSize) {
   int n = real_recv(from, buf, bufSize, 0);
+  if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) return true;
   if (n <= 0) return false;
   int sent = 0;
   while (sent < n) {
     int m = real_send(to, buf + sent, n - sent, 0);
+    if (m == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
+      fd_set wfds;
+      FD_ZERO(&wfds);
+      FD_SET(to, &wfds);
+      timeval tv = {5, 0};
+      if (select(0, NULL, &wfds, NULL, &tv) <= 0) return false;
+      continue;
+    }
     if (m <= 0) return false;
     sent += m;
   }
@@ -686,6 +695,9 @@ DWORD WINAPI Ipv6RelayWorkerThread(LPVOID param) {
     closesocket(client);
     return 0;
   }
+  DWORD timeoutMs = 10000;
+  setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeoutMs, sizeof(timeoutMs));
+  setsockopt(upstream, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeoutMs, sizeof(timeoutMs));
   if (!ConnectSocketToUpstreamProxy(upstream)) {
     NetLog("[Proxy] IPv6 relay failed to connect upstream %s:%d for %s:%d | %s (err=%d)",
            g_ProxyIP.c_str(), g_ProxyPort, target.target_ip.c_str(), target.target_port,
@@ -701,6 +713,8 @@ DWORD WINAPI Ipv6RelayWorkerThread(LPVOID param) {
     closesocket(client);
     return 0;
   }
+  NetLog("[Proxy] IPv6 relay proxy handshake OK: %s:%d | %s",
+         target.target_ip.c_str(), target.target_port, target.domain.c_str());
   if (!target.initial_data.empty()) {
     int sent = 0;
     while (sent < (int)target.initial_data.size()) {
@@ -755,6 +769,8 @@ DWORD WINAPI Ipv6RelayAcceptThread(LPVOID) {
       closesocket(c);
       continue;
     }
+    NetLog("[Proxy] IPv6 relay accepted local port %u -> %s:%d | %s",
+           port, target.target_ip.c_str(), target.target_port, target.domain.c_str());
     RelayWorkerParam *rp = new RelayWorkerParam{c, target};
     HANDLE h = CreateThread(NULL, 0, Ipv6RelayWorkerThread, rp, 0, NULL);
     if (h) CloseHandle(h);
@@ -988,13 +1004,22 @@ bool PerformHttpConnect(SOCKET s, const char *ip_str, int port, int family, cons
 
 bool PerformSocks5Connect(SOCKET s, const char *ip_str, int port, int family, const std::string& domain) {
   unsigned char hello[3] = {0x05, 0x01, 0x00}; // SOCKS5, one method, no-auth
-  if (!SyncSend(s, (const char*)hello, sizeof(hello)))
+  if (!SyncSend(s, (const char*)hello, sizeof(hello))) {
+    NetLog("[Proxy] SOCKS5 hello send failed: %s:%d | %s (err=%d)",
+           ip_str, port, domain.c_str(), WSAGetLastError());
     return false;
+  }
   unsigned char helloResp[2] = {0};
-  if (!SyncRecvExact(s, (char*)helloResp, sizeof(helloResp)))
+  if (!SyncRecvExact(s, (char*)helloResp, sizeof(helloResp))) {
+    NetLog("[Proxy] SOCKS5 hello recv failed: %s:%d | %s (err=%d)",
+           ip_str, port, domain.c_str(), WSAGetLastError());
     return false;
-  if (helloResp[0] != 0x05 || helloResp[1] != 0x00)
+  }
+  if (helloResp[0] != 0x05 || helloResp[1] != 0x00) {
+    NetLog("[Proxy] SOCKS5 hello rejected: %s:%d | %s (ver=%u method=%u)",
+           ip_str, port, domain.c_str(), helloResp[0], helloResp[1]);
     return false;
+  }
 
   std::vector<unsigned char> req;
   req.push_back(0x05); // VER
@@ -1007,16 +1032,20 @@ bool PerformSocks5Connect(SOCKET s, const char *ip_str, int port, int family, co
     req.insert(req.end(), domain.begin(), domain.end());
   } else if (family == AF_INET6) {
     in6_addr a6;
-    if (inet_pton(AF_INET6, ip_str, &a6) != 1)
+    if (inet_pton(AF_INET6, ip_str, &a6) != 1) {
+      NetLog("[Proxy] SOCKS5 invalid IPv6 target: %s:%d", ip_str, port);
       return false;
+    }
     req.push_back(0x04); // ATYP IPv6
     unsigned char *p = (unsigned char*)&a6;
     req.insert(req.end(), p, p + 16);
   } else {
     in_addr a4;
     const char *final_host = (port == 53) ? "8.8.8.8" : ip_str;
-    if (inet_pton(AF_INET, final_host, &a4) != 1)
+    if (inet_pton(AF_INET, final_host, &a4) != 1) {
+      NetLog("[Proxy] SOCKS5 invalid IPv4 target: %s:%d", final_host, port);
       return false;
+    }
     req.push_back(0x01); // ATYP IPv4
     unsigned char *p = (unsigned char*)&a4;
     req.insert(req.end(), p, p + 4);
@@ -1024,14 +1053,23 @@ bool PerformSocks5Connect(SOCKET s, const char *ip_str, int port, int family, co
   req.push_back((unsigned char)((port >> 8) & 0xFF));
   req.push_back((unsigned char)(port & 0xFF));
 
-  if (!SyncSend(s, (const char*)req.data(), (int)req.size()))
+  if (!SyncSend(s, (const char*)req.data(), (int)req.size())) {
+    NetLog("[Proxy] SOCKS5 connect request send failed: %s:%d | %s (err=%d)",
+           ip_str, port, domain.c_str(), WSAGetLastError());
     return false;
+  }
 
   unsigned char head[4] = {0};
-  if (!SyncRecvExact(s, (char*)head, sizeof(head)))
+  if (!SyncRecvExact(s, (char*)head, sizeof(head))) {
+    NetLog("[Proxy] SOCKS5 connect reply recv failed: %s:%d | %s (err=%d)",
+           ip_str, port, domain.c_str(), WSAGetLastError());
     return false;
-  if (head[0] != 0x05 || head[1] != 0x00)
+  }
+  if (head[0] != 0x05 || head[1] != 0x00) {
+    NetLog("[Proxy] SOCKS5 connect rejected: %s:%d | %s (ver=%u rep=%u atyp=%u)",
+           ip_str, port, domain.c_str(), head[0], head[1], head[3]);
     return false;
+  }
 
   int addrLen = 0;
   if (head[3] == 0x01) addrLen = 4;
@@ -1041,10 +1079,18 @@ bool PerformSocks5Connect(SOCKET s, const char *ip_str, int port, int family, co
     if (!SyncRecvExact(s, (char*)&lenByte, 1)) return false;
     addrLen = lenByte;
   } else {
+    NetLog("[Proxy] SOCKS5 connect reply has unsupported ATYP: %s:%d | %s (atyp=%u)",
+           ip_str, port, domain.c_str(), head[3]);
     return false;
   }
   std::vector<char> tail(addrLen + 2);
-  return SyncRecvExact(s, tail.data(), (int)tail.size());
+  if (!SyncRecvExact(s, tail.data(), (int)tail.size())) {
+    NetLog("[Proxy] SOCKS5 connect reply tail recv failed: %s:%d | %s (err=%d)",
+           ip_str, port, domain.c_str(), WSAGetLastError());
+    return false;
+  }
+  NetLog("[Proxy] SOCKS5 handshake OK: %s:%d | %s", ip_str, port, domain.c_str());
+  return true;
 }
 
 bool PerformProxyConnect(SOCKET s, const char *ip_str, int port, int family, const std::string& domain) {
