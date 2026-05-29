@@ -227,6 +227,40 @@ bool ShouldFastFailIpv6Connect(int family, bool is_local) {
     return family == AF_INET6 && !is_local && g_Ipv6ConnectMode == Ipv6ConnectMode::Fail;
 }
 
+int GetSocketType(SOCKET s) {
+  int type = 0;
+  int optlen = sizeof(type);
+  if (getsockopt(s, SOL_SOCKET, SO_TYPE, (char *)&type, &optlen) != 0) {
+    return 0;
+  }
+  return type;
+}
+
+bool IsStreamSocket(SOCKET s) {
+  return GetSocketType(s) == SOCK_STREAM;
+}
+
+bool ShouldRejectUnsupportedUdpConnect(SOCKET s, const char *api, int family, const char *ip, int port, const std::string &domain) {
+  int type = GetSocketType(s);
+  if (type == 0 || type == SOCK_STREAM) return false;
+
+  // This proxifier currently tunnels TCP CONNECT through HTTP/SOCKS5.  A UDP
+  // connect() call is only a default peer assignment; redirecting that socket
+  // to the TCP loopback relay creates a fake "redirect" log line but no relay
+  // accept can ever happen.  UDP/443 is usually QUIC/DoH and should fail fast
+  // so the caller falls back to TCP, which can be proxied correctly.
+  if (type == SOCK_DGRAM && port == 443) {
+    NetLog("[hook] %s UDP/443 unsupported by TCP proxy; fast-fail: %s:%d | %s",
+           api, ip, port, domain.c_str());
+    WSASetLastError(family == AF_INET6 ? WSAEHOSTUNREACH : WSAECONNREFUSED);
+    return true;
+  }
+
+  NetLog("[hook] %s non-TCP socket bypass proxy: %s:%d | %s (type=%d)",
+         api, ip, port, domain.c_str(), type);
+  return false;
+}
+
 bool ShouldBlockDohConnect(int family, const char* ip, int port) {
     if (!IsKnownDoHServer(ip, port)) return false;
     // Do not block TCP/443 to public DNS endpoints when DNS proxying is enabled:
@@ -1507,6 +1541,13 @@ BOOL PASCAL hook_ConnectEx(SOCKET s, const struct sockaddr *name, int namelen,
       WSASetLastError(WSAECONNREFUSED);
       return FALSE;
     }
+    if (!IsStreamSocket(s)) {
+      if (ShouldRejectUnsupportedUdpConnect(s, "ConnectEx", name->sa_family, ip, port, domain)) {
+        return FALSE;
+      }
+      return real_ConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength,
+                            lpBytesSent, lpOverlapped);
+    }
     if (ShouldFastFailIpv6Connect(name->sa_family, is_local)) {
       NetLog("[hook] Fast-fail IPv6 connect: %s:%d (ipv6_connect=fail)", ip, port);
       WSASetLastError(WSAEHOSTUNREACH);
@@ -1570,6 +1611,13 @@ int WINAPI hook_WSAConnect(SOCKET s, const sockaddr *name, int namelen,
       NetLog("[hook] Blocking DoH server %s:%d to force DNS fallback", ip, port);
       WSASetLastError(WSAECONNREFUSED);
       return SOCKET_ERROR;
+    }
+    if (!IsStreamSocket(s)) {
+      if (ShouldRejectUnsupportedUdpConnect(s, "WSAConnect", name->sa_family, ip, port, domain)) {
+        return SOCKET_ERROR;
+      }
+      return real_WSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS,
+                             lpGQOS);
     }
     if (ShouldFastFailIpv6Connect(name->sa_family, is_local)) {
       NetLog("[hook] Fast-fail IPv6 connect: %s:%d (ipv6_connect=fail)", ip, port);
@@ -1638,6 +1686,12 @@ int WINAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
       NetLog("[hook] Blocking DoH server %s:%d to force DNS fallback", ip, port);
       WSASetLastError(WSAECONNREFUSED);
       return SOCKET_ERROR;
+    }
+    if (!IsStreamSocket(s)) {
+      if (ShouldRejectUnsupportedUdpConnect(s, "connect", name->sa_family, ip, port, domain)) {
+        return SOCKET_ERROR;
+      }
+      return real_connect(s, name, namelen);
     }
     if (ShouldFastFailIpv6Connect(name->sa_family, is_local)) {
       NetLog("[hook] Fast-fail IPv6 connect: %s:%d (ipv6_connect=fail)", ip, port);
